@@ -1,17 +1,17 @@
 #[macro_use]
 extern crate log;
 
-use text_io::{read, try_read, try_scan};
-use indoc::indoc;
 use digest::Digest;
-use serde::{Serialize, Deserialize};
+use generic_array::{typenum::U32, GenericArray};
 use hashbrown::{HashMap, HashSet};
-use generic_array::{GenericArray, typenum::U32};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use indoc::indoc;
+use serde::{Deserialize, Serialize};
+use std::io::BufRead;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::io::BufRead;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use text_io::{read, try_read, try_scan};
 
 fn logger_init() {
     use simplelog::*;
@@ -88,42 +88,27 @@ struct ProgState {
     modified: bool,
 }
 
-/* cmd ops:
-
-_ --> set-sfile
-rm indexed.txt  --> i:clear
-lift_file.sh    --> i:ingest (apply sha256sum to every entry)
-
- */
-
 fn read_from_file<P: AsRef<Path>>(path: P) -> std::io::Result<readfilez::FileHandle> {
     readfilez::read_from_file(std::fs::File::open(path))
 }
 
 impl ProgState {
     fn load_from_sfile(&mut self) -> Result<(), String> {
-        let fh = read_from_file(&self.sfile);
-        if let Err(x) = &fh {
-            return Err(format!("Unable to open sfile ({}: {})", self.sfile.display(), x));
-        }
-        let fh = fh.unwrap();
+        let fh = read_from_file(&self.sfile)
+            .map_err(|x| format!("Unable to open sfile ({}: {})", self.sfile.display(), x))?;
         let z = flate2::read::DeflateDecoder::new(fh.as_slice());
-        match bincode::deserialize_from(z) {
-            Ok(x) => {
-                self.detail = x;
-                self.modified = false;
-            },
-            Err(x) => {
-                return Err(format!("Unable to read sfile ({}: {})", self.sfile.display(), x));
-            }
-        }
+        self.detail = bincode::deserialize_from(z)
+            .map_err(|x| format!("Unable to read sfile ({}: {})", self.sfile.display(), x))?;
+        self.modified = false;
         Ok(())
     }
 
     fn save_to_sfile(&mut self) -> Result<(), String> {
-        let fh = std::fs::File::create(&self.sfile).map_err(|x| format!("Failed to create sfile ({}: {})", self.sfile.display(), x))?;
+        let fh = std::fs::File::create(&self.sfile)
+            .map_err(|x| format!("Failed to create sfile ({}: {})", self.sfile.display(), x))?;
         let z = flate2::write::DeflateEncoder::new(fh, flate2::Compression::default());
-        bincode::serialize_into(z, &self.detail).map_err(|x| format!("Failed to write sfile ({}: {})", self.sfile.display(), x))?;
+        bincode::serialize_into(z, &self.detail)
+            .map_err(|x| format!("Failed to write sfile ({}: {})", self.sfile.display(), x))?;
         self.modified = false;
         Ok(())
     }
@@ -166,22 +151,22 @@ fn main() {
                 } else {
                     break;
                 }
-            },
+            }
             "s:clear-modified-flag" => {
                 pstate.modified = false;
-            },
+            }
             "s:load" => {
                 if pstate.modified {
                     error!("you have modified data... call 's:clear-modified-flag' OR 's:save' before loading");
                 } else if let Err(x) = pstate.load_from_sfile() {
                     error!("{}", x);
                 }
-            },
+            }
             "s:save" => {
                 if let Err(x) = pstate.save_to_sfile() {
                     error!("{}", x);
                 }
-            },
+            }
             "i:print-debug" => {
                 for (cs, ixe) in &pstate.detail.idxd {
                     println!("{} {} {:?}", hex::encode(cs), ixe.is_fin, ixe.paths);
@@ -190,13 +175,19 @@ fn main() {
             "i:clear" => {
                 pstate.modified = true;
                 pstate.detail.idxd.clear();
-            },
+            }
             "i:gc" => {
                 pstate.modified = true;
-                pstate.detail.idxd.retain(|_, ixe| !ixe.is_fin && !ixe.paths.is_empty());
+                pstate
+                    .detail
+                    .idxd
+                    .retain(|_, ixe| !ixe.is_fin && !ixe.paths.is_empty());
             }
             "help" => {
-                println!("{}", indoc!("
+                println!(
+                    "{}",
+                    indoc!(
+                        "
                     Commands:
                     exit | quit      exit this program without saving
                     s:load           load state from sfile (defaults to 'progstate.txt')
@@ -209,7 +200,9 @@ fn main() {
                     i:print-debug    print the whole index
                     h:set FILE       set used hook (USAGE: ./hook.sh PATH)
                     run              process files from index
-                    "));
+                    "
+                    )
+                );
             }
             "run" => {
                 pstate.modified = true;
@@ -228,8 +221,8 @@ fn main() {
                         }
                         println!("{} {}", cshex, path);
                         let cmdres = std::process::Command::new(&pstate.detail.hook)
-                        .arg(path)
-                        .status();
+                            .arg(path)
+                            .status();
                         match cmdres {
                             Ok(x) if x.success() => {
                                 ixe.is_fin = true;
@@ -288,10 +281,12 @@ fn main() {
                             write!(stdout, ".").unwrap();
                             stdout.flush().unwrap();
                             hasher.input(fh2.unwrap().as_slice());
-                            let ent = pstate.detail.idxd.entry(hasher.result_reset()).or_insert(IndexEntry {
-                                is_fin: false,
-                                paths: HashSet::new(),
-                            });
+                            let ent = pstate.detail.idxd.entry(hasher.result_reset()).or_insert(
+                                IndexEntry {
+                                    is_fin: false,
+                                    paths: HashSet::new(),
+                                },
+                            );
                             ent.paths.insert(ril.to_string());
                         }
                         println!("");
