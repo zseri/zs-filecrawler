@@ -207,13 +207,20 @@ fn main() {
             "run" => {
                 pstate.modified = true;
                 sigdat.set_ctrlc_armed(false);
+                let mut n: usize = 0;
+                let mut nmax = pstate.detail.idxd.len();
                 for (cs, ixe) in &mut pstate.detail.idxd {
                     if sigdat.got_ctrlc() {
                         break;
                     }
                     if ixe.is_fin || ixe.paths.is_empty() {
+                        nmax -= 1;
                         continue;
                     }
+                    if n % 10 == 0 {
+                        info!("[{}%]", (n * 100) / nmax);
+                    }
+                    n += 1;
                     let cshex = hex::encode(cs);
                     for path in &ixe.paths {
                         if sigdat.got_ctrlc() {
