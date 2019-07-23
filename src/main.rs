@@ -112,6 +112,14 @@ impl ProgState {
         self.modified = false;
         Ok(())
     }
+
+    fn idx_gc(&mut self) {
+        self.modified = true;
+        self.detail.idxd.retain(|_, ixe| {
+            ixe.paths.retain(|f| Path::new(f).is_file());
+            !ixe.paths.is_empty()
+        });
+    }
 }
 
 fn main() {
@@ -177,11 +185,11 @@ fn main() {
                 pstate.detail.idxd.clear();
             }
             "i:gc" => {
-                pstate.modified = true;
-                pstate
-                    .detail
-                    .idxd
-                    .retain(|_, ixe| !ixe.is_fin && !ixe.paths.is_empty());
+                pstate.idx_gc();
+            }
+            "i:gc-aggressive" => {
+                pstate.idx_gc();
+                pstate.detail.idxd.retain(|_, ixe| !ixe.is_fin);
             }
             "help" => {
                 println!(
@@ -194,7 +202,9 @@ fn main() {
                     s:save           save state to sfile
                     s:set-file FILE  change used sfile to FILE
                     i:clear          clear the index
-                    i:gc             run index garbage-collection (drop already finished
+                    i:gc             run index garbage-collection (drop missing files
+                                         and entries without associated files)
+                    i:gc-aggressive  run index garbage-collection (drop already finished
                                          entries and entries without associated files)
                     i:ingest FILE    read file paths from FILE (advice: use absolute paths)
                     i:print-debug    print the whole index
