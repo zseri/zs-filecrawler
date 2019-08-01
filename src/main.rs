@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::io::BufRead;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use text_io::{read, try_read, try_scan};
 
@@ -114,11 +114,55 @@ impl ProgState {
     }
 
     fn idx_gc(&mut self) {
+        use rayon::prelude::*;
+
         self.modified = true;
-        self.detail.idxd.retain(|_, ixe| {
+        self.detail.idxd.par_iter_mut().for_each(|(_, ixe)| {
             ixe.paths.retain(|f| Path::new(f).is_file());
-            !ixe.paths.is_empty()
         });
+        self.detail.idxd.retain(|_, ixe| !ixe.paths.is_empty());
+    }
+    fn run(&mut self, sigdat: SignalData) {
+        use rayon::prelude::*;
+
+        self.modified = true;
+        sigdat.set_ctrlc_armed(false);
+        let n = AtomicUsize::new(0);
+        let nmax = AtomicUsize::new(self.detail.idxd.len());
+        let hook = self.detail.hook.clone();
+        self.detail.idxd.par_iter_mut().for_each(|(cs, ixe)| {
+            if sigdat.got_ctrlc() {
+                return;
+            }
+            if ixe.is_fin || ixe.paths.is_empty() {
+                nmax.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+            let n_ = n.load(Ordering::SeqCst);
+            if n_ % 10 == 0 {
+                info!("[{}%]", (n_ * 100) / nmax.load(Ordering::SeqCst));
+            }
+            n.fetch_add(1, Ordering::SeqCst);
+            let cshex = hex::encode(cs);
+            for path in &ixe.paths {
+                if sigdat.got_ctrlc() {
+                    break;
+                }
+                println!("{} {}", cshex, path);
+                let cmdres = std::process::Command::new(&hook).arg(path).status();
+                match cmdres {
+                    Ok(x) if x.success() => {
+                        ixe.is_fin = true;
+                        break;
+                    }
+                    _ => {
+                        warn!("HOOK failed with {:?}", cmdres);
+                    }
+                }
+            }
+        });
+        sigdat.set_ctrlc(false);
+        sigdat.set_ctrlc_armed(true);
     }
 }
 
@@ -214,46 +258,7 @@ fn main() {
                     )
                 );
             }
-            "run" => {
-                pstate.modified = true;
-                sigdat.set_ctrlc_armed(false);
-                let mut n: usize = 0;
-                let mut nmax = pstate.detail.idxd.len();
-                for (cs, ixe) in &mut pstate.detail.idxd {
-                    if sigdat.got_ctrlc() {
-                        break;
-                    }
-                    if ixe.is_fin || ixe.paths.is_empty() {
-                        nmax -= 1;
-                        continue;
-                    }
-                    if n % 10 == 0 {
-                        info!("[{}%]", (n * 100) / nmax);
-                    }
-                    n += 1;
-                    let cshex = hex::encode(cs);
-                    for path in &ixe.paths {
-                        if sigdat.got_ctrlc() {
-                            break;
-                        }
-                        println!("{} {}", cshex, path);
-                        let cmdres = std::process::Command::new(&pstate.detail.hook)
-                            .arg(path)
-                            .status();
-                        match cmdres {
-                            Ok(x) if x.success() => {
-                                ixe.is_fin = true;
-                                break;
-                            }
-                            _ => {
-                                warn!("HOOK failed with {:?}", cmdres);
-                            }
-                        }
-                    }
-                }
-                sigdat.set_ctrlc(false);
-                sigdat.set_ctrlc_armed(true);
-            }
+            "run" => pstate.run(sigdat.clone()),
             _ => {
                 let (cmd, rest) = split_command(line);
                 let rest = rest.trim();
