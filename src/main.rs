@@ -113,15 +113,22 @@ impl ProgState {
         Ok(())
     }
 
-    fn idx_gc(&mut self) {
+    // fnx(ixe) -> bool :: @return : keep if true
+    fn idx_gc<FnT: Fn(&IndexEntry) -> bool>(&mut self, fnx: FnT) {
         use rayon::prelude::*;
 
         self.modified = true;
         self.detail.idxd.par_iter_mut().for_each(|(_, ixe)| {
-            ixe.paths.retain(|f| Path::new(f).is_file());
+            if ixe.is_fin {
+                ixe.paths.clear();
+            } else {
+                ixe.paths.retain(|f| Path::new(f).is_file());
+            }
+            ixe.paths.shrink_to_fit();
         });
-        self.detail.idxd.retain(|_, ixe| !ixe.paths.is_empty());
+        self.detail.idxd.retain(|_, ixe| fnx(ixe));
     }
+
     fn run(&mut self, sigdat: SignalData) {
         use rayon::prelude::*;
 
@@ -228,12 +235,14 @@ fn main() {
                 pstate.modified = true;
                 pstate.detail.idxd.clear();
             }
+            "i:clear-unfin" => {
+                pstate.idx_gc(|ixe| ixe.is_fin);
+            }
             "i:gc" => {
-                pstate.idx_gc();
+                pstate.idx_gc(|ixe| !ixe.paths.is_empty() || ixe.is_fin);
             }
             "i:gc-aggressive" => {
-                pstate.idx_gc();
-                pstate.detail.idxd.retain(|_, ixe| !ixe.is_fin);
+                pstate.idx_gc(|ixe| !ixe.paths.is_empty() && !ixe.is_fin);
             }
             "help" => {
                 println!(
@@ -246,6 +255,7 @@ fn main() {
                     s:save           save state to sfile
                     s:set-file FILE  change used sfile to FILE
                     i:clear          clear the index
+                    i:clear-unfin    clear all unfinished index entries
                     i:gc             run index garbage-collection (drop missing files
                                          and entries without associated files)
                     i:gc-aggressive  run index garbage-collection (drop already finished
