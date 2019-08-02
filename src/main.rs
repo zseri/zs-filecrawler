@@ -79,6 +79,7 @@ struct IndexEntry {
 struct ProgStateDetail {
     hook: PathBuf,
     idxd: HashMap<GenericArray<u8, U32>, IndexEntry>,
+    use_multiproc: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -137,10 +138,8 @@ impl ProgState {
         let n = AtomicUsize::new(0);
         let nmax = AtomicUsize::new(self.detail.idxd.len());
         let hook = self.detail.hook.clone();
-        self.detail.idxd.par_iter_mut().for_each(|(cs, ixe)| {
-            if sigdat.got_ctrlc() {
-                return;
-            }
+
+        let worker = |cs, ixe: &mut IndexEntry| {
             if ixe.is_fin || ixe.paths.is_empty() {
                 nmax.fetch_sub(1, Ordering::SeqCst);
                 return;
@@ -167,7 +166,23 @@ impl ProgState {
                     }
                 }
             }
-        });
+        };
+
+        if self.detail.use_multiproc {
+            self.detail.idxd.par_iter_mut().for_each(|(cs, ixe)| {
+                if sigdat.got_ctrlc() {
+                    return;
+                }
+                worker(cs, ixe);
+            });
+        } else {
+            for (cs, ixe) in &mut self.detail.idxd {
+                if sigdat.got_ctrlc() {
+                    break;
+                }
+                worker(cs, ixe);
+            }
+        }
         sigdat.set_ctrlc(false);
         sigdat.set_ctrlc_armed(true);
     }
@@ -189,6 +204,7 @@ fn main() {
         detail: ProgStateDetail {
             hook: PathBuf::from("hook.sh"),
             idxd: HashMap::new(),
+            use_multiproc: false,
         },
         modified: false,
     };
@@ -254,6 +270,7 @@ fn main() {
                     s:load           load state from sfile (defaults to 'progstate.txt')
                     s:save           save state to sfile
                     s:set-file FILE  change used sfile to FILE
+                    s:use-mp y|n     enable/disable parallel hook runs
                     i:clear          clear the index
                     i:clear-unfin    clear all unfinished index entries
                     i:gc             run index garbage-collection (drop missing files
@@ -324,6 +341,13 @@ fn main() {
                         println!("");
                         sigdat.set_ctrlc(false);
                         sigdat.set_ctrlc_armed(true);
+                    }
+                    "s:use-mp" => {
+                        match rest {
+                            "Y" | "y" | "yes" => pstate.detail.use_multiproc = true,
+                            "N" | "n" | "no" => pstate.detail.use_multiproc = false,
+                            _ => error!("unknown specifier"),
+                        }
                     }
                     _ => {
                         error!("Unknown command!");
