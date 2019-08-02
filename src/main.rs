@@ -6,11 +6,14 @@ use generic_array::{typenum::U32, GenericArray};
 use hashbrown::{HashMap, HashSet};
 use indoc::indoc;
 use serde::{Deserialize, Serialize};
-use std::io::BufRead;
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::{
+    io::{BufRead, Write},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 use text_io::{read, try_read, try_scan};
 
 mod signals;
@@ -113,7 +116,6 @@ impl ProgStateDetail {
         }
         sigdat.set_ctrlc_armed(true);
     }
-
 }
 
 impl ProgState {
@@ -251,7 +253,7 @@ fn main() {
             "run" => {
                 pstate.modified = true;
                 pstate.detail.run(sigdat.clone());
-            },
+            }
             _ => {
                 let (cmd, rest) = split_command(line);
                 let rest = rest.trim();
@@ -307,13 +309,11 @@ fn main() {
                         println!("");
                         sigdat.set_ctrlc_armed(true);
                     }
-                    "s:use-mp" => {
-                        match rest {
-                            "Y" | "y" | "yes" => pstate.detail.use_multiproc = true,
-                            "N" | "n" | "no" => pstate.detail.use_multiproc = false,
-                            _ => error!("unknown specifier"),
-                        }
-                    }
+                    "s:use-mp" => match rest {
+                        "Y" | "y" | "yes" => pstate.detail.use_multiproc = true,
+                        "N" | "n" | "no" => pstate.detail.use_multiproc = false,
+                        _ => error!("unknown specifier"),
+                    },
                     _ => {
                         error!("Unknown command!");
                     }

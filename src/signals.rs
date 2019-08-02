@@ -1,5 +1,7 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 pub struct SignalDataIntern {
     ctrlc: AtomicBool,
@@ -34,12 +36,10 @@ impl SignalDataIntern {
 }
 
 pub fn register_signal_handlers(dat: SignalData) {
-    unsafe {
-        signal_hook::register(signal_hook::SIGINT, move || dat.handle_ctrlc())
-    }
-    .or_else(|e| {
-        warn!("Failed to register for SIGINT {:?}", e);
-        Err(e)
-    })
-    .ok();
+    unsafe { signal_hook::register(signal_hook::SIGINT, move || dat.handle_ctrlc()) }
+        .or_else(|e| {
+            warn!("Failed to register for SIGINT {:?}", e);
+            Err(e)
+        })
+        .ok();
 }
