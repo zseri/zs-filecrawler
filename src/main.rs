@@ -34,26 +34,25 @@ impl SignalDataIntern {
     pub fn got_ctrlc(&self) -> bool {
         self.ctrlc.load(Ordering::SeqCst)
     }
-    pub fn set_ctrlc(&self, val: bool) {
-        self.ctrlc.store(val, Ordering::SeqCst);
+    pub fn handle_ctrlc(&self) {
+        if self.is_ctrlc_armed() {
+            std::process::exit(128 + signal_hook::SIGINT);
+        } else {
+            self.ctrlc.store(true, Ordering::SeqCst);
+        }
     }
     pub fn is_ctrlc_armed(&self) -> bool {
         self.ctrlc_armed.load(Ordering::SeqCst)
     }
     pub fn set_ctrlc_armed(&self, val: bool) {
         self.ctrlc_armed.store(val, Ordering::SeqCst);
+        self.ctrlc.store(false, Ordering::SeqCst);
     }
 }
 
 fn register_signal_handlers(dat: SignalData) {
     unsafe {
-        signal_hook::register(signal_hook::SIGINT, move || {
-            if dat.is_ctrlc_armed() {
-                std::process::exit(128 + signal_hook::SIGINT);
-            } else {
-                dat.set_ctrlc(true);
-            }
-        })
+        signal_hook::register(signal_hook::SIGINT, move || dat.handle_ctrlc())
     }
     .or_else(|e| {
         warn!("Failed to register for SIGINT {:?}", e);
@@ -146,7 +145,6 @@ impl ProgStateDetail {
                 worker(cs, ixe);
             }
         }
-        sigdat.set_ctrlc(false);
         sigdat.set_ctrlc_armed(true);
     }
 
@@ -344,7 +342,6 @@ fn main() {
                             ent.paths.insert(ril.to_string());
                         }
                         println!("");
-                        sigdat.set_ctrlc(false);
                         sigdat.set_ctrlc_armed(true);
                     }
                     "s:use-mp" => {
