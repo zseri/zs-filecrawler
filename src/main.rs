@@ -47,10 +47,12 @@ struct IndexEntry {
     paths: HashSet<String>,
 }
 
+type Index = HashMap<GenericArray<u8, U32>, IndexEntry>;
+
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 struct ProgStateDetail {
     hook: PathBuf,
-    idxd: HashMap<GenericArray<u8, U32>, IndexEntry>,
+    idxd: Index,
     use_multiproc: bool,
 }
 
@@ -116,59 +118,56 @@ impl ProgStateDetail {
         }
         sigdat.set_ctrlc_armed(true);
     }
+}
 
-    fn ingest(&mut self, sigdat: SignalData, filename: &str) -> bool {
-        let mut stdout = std::io::stdout();
-        let fh = read_from_file(filename);
-        if let Err(x) = &fh {
-            error!("Unable to open input file ({}: {})", filename, x);
-            return false;
-        }
-        sigdat.set_ctrlc_armed(false);
-        let mut hasher = sha2::Sha256::new();
-        let mut cnt_plus: usize = 0;
-        let mut cnt_fin: usize = 0;
-        for ingline in fh.unwrap().as_slice().lines() {
-            if sigdat.got_ctrlc() {
-                break;
-            }
-            if let Err(x) = &ingline {
-                writeln!(stdout, "").unwrap();
-                warn!("Got invalid line: {}", x);
-                continue;
-            }
-            let ril = ingline.unwrap();
-            let ril = ril.trim_start();
-            if ril.is_empty() || ril.bytes().nth(0).unwrap() == b'#' {
-                continue;
-            }
-            let fh2 = read_from_file(ril);
-            if let Err(x) = &fh2 {
-                writeln!(stdout, "").unwrap();
-                warn!("Unable to open input file ({}: {})", ril, x);
-                continue;
-            }
-            stdout.flush().unwrap();
-            hasher.input(fh2.unwrap().as_slice());
-            let ent = self
-                .idxd
-                .entry(hasher.result_reset())
-                .or_insert(IndexEntry {
-                    is_fin: false,
-                    paths: HashSet::new(),
-                });
-            if ent.is_fin {
-                cnt_fin += 1;
-            } else {
-                cnt_plus += 1;
-                ent.paths.insert(ril.to_string());
-            }
-            write!(stdout, "\r{} inserted / {} skipped", cnt_plus, cnt_fin).unwrap();
-        }
-        writeln!(stdout, "").unwrap();
-        sigdat.set_ctrlc_armed(true);
-        return true;
+fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &str) -> bool {
+    let mut stdout = std::io::stdout();
+    let fh = read_from_file(filename);
+    if let Err(x) = &fh {
+        error!("Unable to open input file ({}: {})", filename, x);
+        return false;
     }
+    sigdat.set_ctrlc_armed(false);
+    let mut hasher = sha2::Sha256::new();
+    let mut cnt_plus: usize = 0;
+    let mut cnt_fin: usize = 0;
+    for ingline in fh.unwrap().as_slice().lines() {
+        if sigdat.got_ctrlc() {
+            break;
+        }
+        if let Err(x) = &ingline {
+            writeln!(stdout, "").unwrap();
+            warn!("Got invalid line: {}", x);
+            continue;
+        }
+        let ril = ingline.unwrap();
+        let ril = ril.trim_start();
+        if ril.is_empty() || ril.bytes().nth(0).unwrap() == b'#' {
+            continue;
+        }
+        let fh2 = read_from_file(ril);
+        if let Err(x) = &fh2 {
+            writeln!(stdout, "").unwrap();
+            warn!("Unable to open input file ({}: {})", ril, x);
+            continue;
+        }
+        stdout.flush().unwrap();
+        hasher.input(fh2.unwrap().as_slice());
+        let ent = idxd.entry(hasher.result_reset()).or_insert(IndexEntry {
+            is_fin: false,
+            paths: HashSet::new(),
+        });
+        if ent.is_fin {
+            cnt_fin += 1;
+        } else {
+            cnt_plus += 1;
+            ent.paths.insert(ril.to_string());
+        }
+        write!(stdout, "\r{} inserted / {} skipped", cnt_plus, cnt_fin).unwrap();
+    }
+    writeln!(stdout, "").unwrap();
+    sigdat.set_ctrlc_armed(true);
+    return true;
 }
 
 impl ProgState {
@@ -322,7 +321,7 @@ fn main() {
                         pstate.detail.hook = PathBuf::from(rest);
                     }
                     "i:ingest" => {
-                        if pstate.detail.ingest(sigdat.clone(), rest) {
+                        if idx_ingest(&mut pstate.detail.idxd, sigdat.clone(), rest) {
                             pstate.modified = true;
                         }
                     }
