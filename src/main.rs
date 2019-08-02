@@ -9,9 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::io::BufRead;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use text_io::{read, try_read, try_scan};
+
+mod signals;
+use signals::*;
 
 fn logger_init() {
     use simplelog::*;
@@ -24,48 +27,15 @@ fn logger_init() {
     .unwrap();
 }
 
-struct SignalDataIntern {
-    ctrlc: AtomicBool,
-    ctrlc_armed: AtomicBool,
-}
-type SignalData = Arc<SignalDataIntern>;
-
-impl SignalDataIntern {
-    pub fn got_ctrlc(&self) -> bool {
-        self.ctrlc.load(Ordering::SeqCst)
-    }
-    pub fn handle_ctrlc(&self) {
-        if self.is_ctrlc_armed() {
-            std::process::exit(128 + signal_hook::SIGINT);
-        } else {
-            self.ctrlc.store(true, Ordering::SeqCst);
-        }
-    }
-    pub fn is_ctrlc_armed(&self) -> bool {
-        self.ctrlc_armed.load(Ordering::SeqCst)
-    }
-    pub fn set_ctrlc_armed(&self, val: bool) {
-        self.ctrlc_armed.store(val, Ordering::SeqCst);
-        self.ctrlc.store(false, Ordering::SeqCst);
-    }
-}
-
-fn register_signal_handlers(dat: SignalData) {
-    unsafe {
-        signal_hook::register(signal_hook::SIGINT, move || dat.handle_ctrlc())
-    }
-    .or_else(|e| {
-        warn!("Failed to register for SIGINT {:?}", e);
-        Err(e)
-    })
-    .ok();
-}
-
 fn split_command(line: &str) -> (&str, &str) {
     match line.find(char::is_whitespace) {
         Some(pos) => (&line[..pos], &line[pos + 1..]),
         None => (line, ""),
     }
+}
+
+fn read_from_file<P: AsRef<Path>>(path: P) -> std::io::Result<readfilez::FileHandle> {
+    readfilez::read_from_file(std::fs::File::open(path))
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
@@ -86,10 +56,6 @@ struct ProgState {
     sfile: PathBuf,
     detail: ProgStateDetail,
     modified: bool,
-}
-
-fn read_from_file<P: AsRef<Path>>(path: P) -> std::io::Result<readfilez::FileHandle> {
-    readfilez::read_from_file(std::fs::File::open(path))
 }
 
 impl ProgStateDetail {
@@ -191,10 +157,7 @@ impl ProgState {
 fn main() {
     logger_init();
 
-    let sigdat = Arc::new(SignalDataIntern {
-        ctrlc: AtomicBool::new(false),
-        ctrlc_armed: AtomicBool::new(true),
-    });
+    let sigdat = Arc::new(SignalDataIntern::new());
     register_signal_handlers(sigdat.clone());
 
     let mut stdout = std::io::stdout();
