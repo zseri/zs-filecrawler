@@ -100,6 +100,7 @@ impl ProgStateDetail {
         let n = AtomicUsize::new(0);
         let nmax = AtomicUsize::new(self.idxd.len());
         let hook = &self.hook;
+        let nunit: usize = std::cmp::max(10, self.idxd.len() / 1000);
 
         let worker = |cs, ixe: &mut IndexEntry| {
             if ixe.is_fin || ixe.paths.is_empty() {
@@ -107,7 +108,7 @@ impl ProgStateDetail {
                 return;
             }
             let n_ = n.load(Ordering::SeqCst);
-            if n_ % 10 == 0 {
+            if n_ % nunit == 0 {
                 info!("[{}%]", (n_ * 100) / nmax.load(Ordering::SeqCst));
             }
             n.fetch_add(1, Ordering::SeqCst);
