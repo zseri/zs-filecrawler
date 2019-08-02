@@ -93,6 +93,64 @@ fn read_from_file<P: AsRef<Path>>(path: P) -> std::io::Result<readfilez::FileHan
     readfilez::read_from_file(std::fs::File::open(path))
 }
 
+impl ProgStateDetail {
+    fn run(&mut self, sigdat: SignalData) {
+        use rayon::prelude::*;
+        sigdat.set_ctrlc_armed(false);
+        let n = AtomicUsize::new(0);
+        let nmax = AtomicUsize::new(self.idxd.len());
+        let hook = &self.hook;
+
+        let worker = |cs, ixe: &mut IndexEntry| {
+            if ixe.is_fin || ixe.paths.is_empty() {
+                nmax.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+            let n_ = n.load(Ordering::SeqCst);
+            if n_ % 10 == 0 {
+                info!("[{}%]", (n_ * 100) / nmax.load(Ordering::SeqCst));
+            }
+            n.fetch_add(1, Ordering::SeqCst);
+            let cshex = hex::encode(cs);
+            for path in &ixe.paths {
+                if sigdat.got_ctrlc() {
+                    break;
+                }
+                println!("{} {}", cshex, path);
+                let cmdres = std::process::Command::new(hook).arg(path).status();
+                match cmdres {
+                    Ok(x) if x.success() => {
+                        ixe.is_fin = true;
+                        break;
+                    }
+                    _ => {
+                        warn!("HOOK failed with {:?}", cmdres);
+                    }
+                }
+            }
+        };
+
+        if self.use_multiproc {
+            self.idxd.par_iter_mut().for_each(|(cs, ixe)| {
+                if sigdat.got_ctrlc() {
+                    return;
+                }
+                worker(cs, ixe);
+            });
+        } else {
+            for (cs, ixe) in &mut self.idxd {
+                if sigdat.got_ctrlc() {
+                    break;
+                }
+                worker(cs, ixe);
+            }
+        }
+        sigdat.set_ctrlc(false);
+        sigdat.set_ctrlc_armed(true);
+    }
+
+}
+
 impl ProgState {
     fn load_from_sfile(&mut self) -> Result<(), String> {
         let fh = read_from_file(&self.sfile)
@@ -128,63 +186,6 @@ impl ProgState {
             ixe.paths.shrink_to_fit();
         });
         self.detail.idxd.retain(|_, ixe| fnx(ixe));
-    }
-
-    fn run(&mut self, sigdat: SignalData) {
-        use rayon::prelude::*;
-
-        self.modified = true;
-        sigdat.set_ctrlc_armed(false);
-        let n = AtomicUsize::new(0);
-        let nmax = AtomicUsize::new(self.detail.idxd.len());
-        let hook = self.detail.hook.clone();
-
-        let worker = |cs, ixe: &mut IndexEntry| {
-            if ixe.is_fin || ixe.paths.is_empty() {
-                nmax.fetch_sub(1, Ordering::SeqCst);
-                return;
-            }
-            let n_ = n.load(Ordering::SeqCst);
-            if n_ % 10 == 0 {
-                info!("[{}%]", (n_ * 100) / nmax.load(Ordering::SeqCst));
-            }
-            n.fetch_add(1, Ordering::SeqCst);
-            let cshex = hex::encode(cs);
-            for path in &ixe.paths {
-                if sigdat.got_ctrlc() {
-                    break;
-                }
-                println!("{} {}", cshex, path);
-                let cmdres = std::process::Command::new(&hook).arg(path).status();
-                match cmdres {
-                    Ok(x) if x.success() => {
-                        ixe.is_fin = true;
-                        break;
-                    }
-                    _ => {
-                        warn!("HOOK failed with {:?}", cmdres);
-                    }
-                }
-            }
-        };
-
-        if self.detail.use_multiproc {
-            self.detail.idxd.par_iter_mut().for_each(|(cs, ixe)| {
-                if sigdat.got_ctrlc() {
-                    return;
-                }
-                worker(cs, ixe);
-            });
-        } else {
-            for (cs, ixe) in &mut self.detail.idxd {
-                if sigdat.got_ctrlc() {
-                    break;
-                }
-                worker(cs, ixe);
-            }
-        }
-        sigdat.set_ctrlc(false);
-        sigdat.set_ctrlc_armed(true);
     }
 }
 
@@ -285,7 +286,10 @@ fn main() {
                     )
                 );
             }
-            "run" => pstate.run(sigdat.clone()),
+            "run" => {
+                pstate.modified = true;
+                pstate.detail.run(sigdat.clone());
+            },
             _ => {
                 let (cmd, rest) = split_command(line);
                 let rest = rest.trim();
