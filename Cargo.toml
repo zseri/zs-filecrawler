@@ -1,5 +1,6 @@
 [package]
 name = "zs-filecrawler"
+description = "crawles files, resumable"
 version = "0.0.0"
 authors = ["Erik Zscheile <erik.zscheile@gmail.com>"]
 edition = "2018"
