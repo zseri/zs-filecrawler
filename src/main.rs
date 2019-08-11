@@ -130,6 +130,7 @@ fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &str) -> bool {
     sigdat.set_ctrlc_armed(false);
     let mut hasher = sha2::Sha256::new();
     let mut cnt_plus: usize = 0;
+    let mut cnt_dup: usize = 0;
     let mut cnt_fin: usize = 0;
     for ingline in fh.unwrap().as_slice().lines() {
         if sigdat.got_ctrlc() {
@@ -161,9 +162,12 @@ fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &str) -> bool {
             cnt_fin += 1;
         } else {
             cnt_plus += 1;
+            if !ent.paths.is_empty() {
+                cnt_dup += 1;
+            }
             ent.paths.insert(ril.to_string());
         }
-        write!(stdout, "\r{} inserted / {} skipped", cnt_plus, cnt_fin).unwrap();
+        write!(stdout, "\r{} inserted with {} DUP / {} skipped", cnt_plus, cnt_dup, cnt_fin).unwrap();
     }
     writeln!(stdout, "").unwrap();
     sigdat.set_ctrlc_armed(true);
