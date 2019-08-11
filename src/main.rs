@@ -53,11 +53,13 @@ type Index = HashMap<GenericArray<u8, U32>, IndexEntry>;
 struct ProgStateDetail {
     hook: PathBuf,
     idxd: Index,
+    idx_max_filesize: Option<u64>,
     use_multiproc: bool,
 }
 
 #[derive(Clone, Debug)]
 struct ProgState {
+    inpf_prefix: PathBuf,
     sfile: PathBuf,
     detail: ProgStateDetail,
     modified: bool,
@@ -120,14 +122,30 @@ impl ProgStateDetail {
     }
 }
 
-fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &str) -> bool {
-    let mut stdout = std::io::stdout();
+
+fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &Path, idx_max_filesize: Option<u64>) -> bool {
+    fn does_exceed_max_filesize(filename: &Path, idx_max_filesize: Option<u64>) -> bool {
+        if let Some(max_fsiz) = &idx_max_filesize {
+            if let Ok(fmd) = std::fs::metadata(filename) {
+                if fmd.len() > *max_fsiz {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    if does_exceed_max_filesize(filename, idx_max_filesize) {
+        error!("File is too big: {}", filename.display());
+        return false;
+    }
     let fh = read_from_file(filename);
     if let Err(x) = &fh {
-        error!("Unable to open input file ({}: {})", filename, x);
+        error!("Unable to open input file ({}: {})", filename.display(), x);
         return false;
     }
     sigdat.set_ctrlc_armed(false);
+    let mut stdout = std::io::stdout();
     let mut hasher = sha2::Sha256::new();
     let mut cnt_plus: usize = 0;
     let mut cnt_dup: usize = 0;
@@ -144,6 +162,10 @@ fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &str) -> bool {
         let ril = ingline.unwrap();
         let ril = ril.trim_start();
         if ril.is_empty() || ril.bytes().nth(0).unwrap() == b'#' {
+            continue;
+        }
+        if does_exceed_max_filesize(Path::new(ril), idx_max_filesize) {
+            error!("File is too big: {}", ril);
             continue;
         }
         let fh2 = read_from_file(ril);
@@ -175,6 +197,15 @@ fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &str) -> bool {
 }
 
 impl ProgState {
+    // resolve $x accoording to self.inpf_prefix
+    fn resolve_path(&self, x: &str) -> PathBuf {
+        if Path::new(x).is_relative() {
+            self.inpf_prefix.join(x)
+        } else {
+            PathBuf::from(x)
+        }
+    }
+
     fn load_from_sfile(&mut self) -> Result<(), String> {
         let fh = read_from_file(&self.sfile)
             .map_err(|x| format!("Unable to open sfile ({}: {})", self.sfile.display(), x))?;
@@ -221,10 +252,12 @@ fn main() {
     let mut stdout = std::io::stdout();
 
     let mut pstate = ProgState {
+        inpf_prefix: PathBuf::from("."),
         sfile: PathBuf::from("progstate.txt"),
         detail: ProgStateDetail {
             hook: PathBuf::from("hook.sh"),
             idxd: HashMap::new(),
+            idx_max_filesize: None,
             use_multiproc: false,
         },
         modified: false,
@@ -288,6 +321,14 @@ fn main() {
                         "
                     Commands:
                     exit | quit      exit this program without saving
+                    set-inpf-prefix D use a different directory than the current to
+                                         resolve paths @:
+                                         - s:set-file
+                                         - h:set
+                                         - i:ingest (only the argument to ingest,
+                                             not the content of the ingest file)
+                    i:set-max-filesize SIZ|none
+                                     skip any file with a length greater than SIZ
                     s:load           load state from sfile (defaults to 'progstate.txt')
                     s:save           save state to sfile
                     s:set-file FILE  change used sfile to FILE
@@ -318,14 +359,36 @@ fn main() {
                     continue;
                 }
                 match cmd {
+                    "set-inpf-prefix" => {
+                        pstate.inpf_prefix = PathBuf::from(rest);
+                    }
                     "s:set-file" => {
-                        pstate.sfile = PathBuf::from(rest);
+                        pstate.sfile = pstate.resolve_path(rest);
                     }
                     "h:set" => {
-                        pstate.detail.hook = PathBuf::from(rest);
+                        pstate.detail.hook = pstate.resolve_path(rest);
+                    }
+                    "i:set-max-filesize" => {
+                        if rest == "none" {
+                            pstate.detail.idx_max_filesize = None;
+                            continue;
+                        }
+                        let bytes_cnt = match byte_unit::Byte::from_str(rest) {
+                            Err(x) => {
+                                error!("Got invalid byte unit value: {}: {:?}", rest, x);
+                                continue;
+                            }
+                            Ok(x) => x.get_bytes(),
+                        };
+                        if bytes_cnt >= (std::isize::MAX as u128) {
+                            error!("Given byte unit value is too big: {}", rest);
+                            continue;
+                        }
+                        pstate.detail.idx_max_filesize = Some(bytes_cnt as u64);
                     }
                     "i:ingest" => {
-                        if idx_ingest(&mut pstate.detail.idxd, sigdat.clone(), rest) {
+                        let ingest_inf = pstate.resolve_path(rest);
+                        if idx_ingest(&mut pstate.detail.idxd, sigdat.clone(), &ingest_inf, pstate.detail.idx_max_filesize) {
                             pstate.modified = true;
                         }
                     }
