@@ -132,7 +132,7 @@ fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &Path, idx_max_fil
                 }
             }
         }
-        return false;
+        false
     }
 
     if does_exceed_max_filesize(filename, idx_max_filesize) {
@@ -155,7 +155,7 @@ fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &Path, idx_max_fil
             break;
         }
         if let Err(x) = &ingline {
-            writeln!(stdout, "").unwrap();
+            writeln!(stdout).unwrap();
             warn!("Got invalid line: {}", x);
             continue;
         }
@@ -170,7 +170,7 @@ fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &Path, idx_max_fil
         }
         let fh2 = read_from_file(ril);
         if let Err(x) = &fh2 {
-            writeln!(stdout, "").unwrap();
+            writeln!(stdout).unwrap();
             warn!("Unable to open input file ({}: {})", ril, x);
             continue;
         }
@@ -191,9 +191,9 @@ fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &Path, idx_max_fil
         }
         write!(stdout, "\r{} inserted with {} DUP / {} skipped", cnt_plus, cnt_dup, cnt_fin).unwrap();
     }
-    writeln!(stdout, "").unwrap();
+    writeln!(stdout).unwrap();
     sigdat.set_ctrlc_armed(true);
-    return true;
+    true
 }
 
 impl ProgState {
