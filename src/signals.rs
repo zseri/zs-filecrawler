@@ -10,7 +10,7 @@ pub struct SignalDataIntern {
 pub type SignalData = Arc<SignalDataIntern>;
 
 impl SignalDataIntern {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             ctrlc: AtomicBool::new(false),
             ctrlc_armed: AtomicBool::new(true),

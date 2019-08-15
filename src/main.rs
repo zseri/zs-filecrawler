@@ -66,7 +66,7 @@ struct ProgState {
 }
 
 impl ProgStateDetail {
-    fn run(&mut self, sigdat: SignalData) {
+    fn run(&mut self, sigdat: &SignalData) {
         use rayon::prelude::*;
         sigdat.set_ctrlc_armed(false);
         let n = AtomicUsize::new(0);
@@ -367,7 +367,7 @@ fn main() {
             }
             "run" => {
                 pstate.modified = true;
-                pstate.detail.run(sigdat.clone());
+                pstate.detail.run(&sigdat);
             }
             _ => {
                 let (cmd, rest) = split_command(line);
@@ -398,7 +398,7 @@ fn main() {
                             }
                             Ok(x) => x.get_bytes(),
                         };
-                        if bytes_cnt >= (std::isize::MAX as u128) {
+                        if bytes_cnt >= (isize::max_value() as u128) {
                             error!("Given byte unit value is too big: {}", rest);
                             continue;
                         }
