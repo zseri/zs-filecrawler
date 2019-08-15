@@ -148,6 +148,7 @@ fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &Path, idx_max_fil
     let mut stdout = std::io::stdout();
     let mut hasher = sha2::Sha256::new();
     let mut cnt_plus: usize = 0;
+    let mut cnt_alr: usize = 0;
     let mut cnt_dup: usize = 0;
     let mut cnt_fin: usize = 0;
     for ingline in fh.unwrap().as_slice().lines() {
@@ -174,7 +175,6 @@ fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &Path, idx_max_fil
             warn!("Unable to open input file ({}: {})", ril, x);
             continue;
         }
-        stdout.flush().unwrap();
         hasher.input(fh2.unwrap().as_slice());
         let ent = idxd.entry(hasher.result_reset()).or_insert(IndexEntry {
             is_fin: false,
@@ -183,13 +183,20 @@ fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &Path, idx_max_fil
         if ent.is_fin {
             cnt_fin += 1;
         } else {
+            let len_before = ent.paths.len();
             cnt_plus += 1;
-            if !ent.paths.is_empty() {
-                cnt_dup += 1;
-            }
             ent.paths.insert(ril.to_string());
+            let len_after = ent.paths.len();
+            *(if len_before == len_after {
+                &mut cnt_alr
+            } else if len_after > 1 {
+                &mut cnt_dup
+            } else {
+                &mut cnt_plus
+            }) += 1;
         }
-        write!(stdout, "\r{} inserted with {} DUP / {} skipped", cnt_plus, cnt_dup, cnt_fin).unwrap();
+        stdout.flush().unwrap();
+        write!(stdout, "\r{} inserted / {} skipped / {} DUP / {} finished", cnt_plus, cnt_alr, cnt_dup, cnt_fin).unwrap();
     }
     writeln!(stdout).unwrap();
     sigdat.set_ctrlc_armed(true);
