@@ -79,9 +79,11 @@ impl ProgStateDetail {
                 nmax.fetch_sub(1, Ordering::SeqCst);
                 return;
             }
-            let n_ = n.load(Ordering::SeqCst);
-            if n_ % nunit == 0 {
-                info!("[{}%]", (n_ * 100) / nmax.load(Ordering::SeqCst));
+            if n.load(Ordering::SeqCst) % nunit == 0 {
+                info!(
+                    "[{}%]",
+                    (n.load(Ordering::SeqCst) * 100) / nmax.load(Ordering::SeqCst)
+                );
             }
             n.fetch_add(1, Ordering::SeqCst);
             let cshex = hex::encode(cs);
@@ -122,8 +124,12 @@ impl ProgStateDetail {
     }
 }
 
-
-fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &Path, idx_max_filesize: Option<u64>) -> bool {
+fn idx_ingest(
+    idxd: &mut Index,
+    sigdat: &SignalData,
+    filename: &Path,
+    idx_max_filesize: Option<u64>,
+) -> bool {
     fn does_exceed_max_filesize(filename: &Path, idx_max_filesize: Option<u64>) -> bool {
         if let Some(max_fsiz) = &idx_max_filesize {
             if let Ok(fmd) = std::fs::metadata(filename) {
@@ -196,7 +202,12 @@ fn idx_ingest(idxd: &mut Index, sigdat: SignalData, filename: &Path, idx_max_fil
             }) += 1;
         }
         stdout.flush().unwrap();
-        write!(stdout, "\r{} inserted / {} skipped / {} DUP / {} finished", cnt_plus, cnt_alr, cnt_dup, cnt_fin).unwrap();
+        write!(
+            stdout,
+            "\r{} inserted / {} skipped / {} DUP / {} finished",
+            cnt_plus, cnt_alr, cnt_dup, cnt_fin
+        )
+        .unwrap();
     }
     writeln!(stdout).unwrap();
     sigdat.set_ctrlc_armed(true);
@@ -395,7 +406,12 @@ fn main() {
                     }
                     "i:ingest" => {
                         let ingest_inf = pstate.resolve_path(rest);
-                        if idx_ingest(&mut pstate.detail.idxd, sigdat.clone(), &ingest_inf, pstate.detail.idx_max_filesize) {
+                        if idx_ingest(
+                            &mut pstate.detail.idxd,
+                            &sigdat,
+                            &ingest_inf,
+                            pstate.detail.idx_max_filesize,
+                        ) {
                             pstate.modified = true;
                         }
                     }
