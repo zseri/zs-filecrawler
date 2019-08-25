@@ -68,11 +68,11 @@ struct ProgState {
 impl ProgStateDetail {
     fn run(&mut self, sigdat: &SignalData) {
         use rayon::prelude::*;
-        sigdat.set_ctrlc_armed(false);
         let n = AtomicUsize::new(0);
         let nmax = AtomicUsize::new(self.idxd.len());
         let hook = &self.hook;
         let nunit: usize = std::cmp::max(10, self.idxd.len() / 1000);
+        let sigdat = sigdat.disarm_aquire();
 
         let worker = |cs, ixe: &mut IndexEntry| {
             if ixe.is_fin || ixe.paths.is_empty() {
@@ -120,7 +120,6 @@ impl ProgStateDetail {
                 worker(cs, ixe);
             }
         }
-        sigdat.set_ctrlc_armed(true);
     }
 }
 
@@ -150,7 +149,7 @@ fn idx_ingest(
         error!("Unable to open input file ({}: {})", filename.display(), x);
         return false;
     }
-    sigdat.set_ctrlc_armed(false);
+    let sigdat = sigdat.disarm_aquire();
     let mut stdout = std::io::stdout();
     let mut hasher = sha2::Sha256::new();
     let mut cnt_plus: usize = 0;
@@ -210,7 +209,6 @@ fn idx_ingest(
         .unwrap();
     }
     writeln!(stdout).unwrap();
-    sigdat.set_ctrlc_armed(true);
     true
 }
 
@@ -281,7 +279,7 @@ fn main() {
         modified: false,
     };
 
-    while !sigdat.got_ctrlc() {
+    loop {
         // disable catching of Ctrl-C
         sigdat.set_ctrlc_armed(true);
         let prompt_ptext = if pstate.modified { "*" } else { " " };

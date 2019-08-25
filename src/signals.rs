@@ -9,15 +9,17 @@ pub struct SignalDataIntern {
 }
 pub type SignalData = Arc<SignalDataIntern>;
 
+#[must_use]
+pub struct SignalDataUnArmed<'parent> {
+    parent: &'parent SignalDataIntern,
+}
+
 impl SignalDataIntern {
     pub const fn new() -> Self {
         Self {
             ctrlc: AtomicBool::new(false),
             ctrlc_armed: AtomicBool::new(true),
         }
-    }
-    pub fn got_ctrlc(&self) -> bool {
-        self.ctrlc.load(Ordering::SeqCst)
     }
     pub fn handle_ctrlc(&self) {
         if self.is_ctrlc_armed() {
@@ -32,6 +34,24 @@ impl SignalDataIntern {
     pub fn set_ctrlc_armed(&self, val: bool) {
         self.ctrlc_armed.store(val, Ordering::SeqCst);
         self.ctrlc.store(false, Ordering::SeqCst);
+    }
+    pub fn disarm_aquire(&self) -> SignalDataUnArmed<'_> {
+        self.set_ctrlc_armed(false);
+        SignalDataUnArmed {
+            parent: self,
+        }
+    }
+}
+
+impl SignalDataUnArmed<'_> {
+    pub fn got_ctrlc(&self) -> bool {
+        self.parent.ctrlc.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for SignalDataUnArmed<'_> {
+    fn drop(&mut self) {
+        self.parent.set_ctrlc_armed(true);
     }
 }
 
