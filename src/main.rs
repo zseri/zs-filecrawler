@@ -335,31 +335,31 @@ fn main() {
                     "{}",
                     indoc!(
                         "
-                    Commands:
-                    exit | quit      exit this program without saving
-                    set-inpf-prefix D use a different directory than the current to
+                        Commands:
+                        exit | quit      exit this program without saving
+                        set-inpf-prefix D use a different directory than the current to
                                          resolve paths @:
-                                         - s:set-file
-                                         - h:set
-                                         - i:ingest (only the argument to ingest,
-                                             not the content of the ingest file)
-                    i:set-max-filesize SIZ|none
-                                     skip any file with a length greater than SIZ
-                    s:load           load state from sfile (defaults to 'progstate.txt')
-                    s:save           save state to sfile
-                    s:set-file FILE  change used sfile to FILE
-                    s:use-mp y|n     enable/disable parallel hook runs
-                    i:clear          clear the index
-                    i:clear-unfin    clear all unfinished index entries
-                    i:gc             run index garbage-collection (drop missing files
-                                         and entries without associated files)
-                    i:gc-aggressive  run index garbage-collection (drop already finished
-                                         entries and entries without associated files)
-                    i:ingest FILE    read file paths from FILE (advice: use absolute paths)
-                    i:print-debug    print the whole index
-                    h:set FILE       set used hook (USAGE: ./hook.sh PATH)
-                    run              process files from index
-                    "
+                                             - s:set-file
+                                             - h:set
+                                             - i:ingest (only the argument to ingest,
+                                                 not the content of the ingest file)
+                        i:set-max-filesize SIZ|none
+                                         skip any file with a length greater than SIZ
+                        s:load           load state from sfile (defaults to 'progstate.txt')
+                        s:save           save state to sfile
+                        s:set-file FILE  change used sfile to FILE
+                        s:use-mp y|n     enable/disable parallel hook runs
+                        i:clear          clear the index
+                        i:clear-unfin    clear all unfinished index entries
+                        i:gc             run index garbage-collection (drop missing files
+                                             and entries without associated files)
+                        i:gc-aggressive  run index garbage-collection (drop already finished
+                                             entries and entries without associated files)
+                        i:ingest FILE    read file paths from FILE (advice: use absolute paths)
+                        i:print-debug    print the whole index
+                        h:set FILE       set used hook (USAGE: ./hook.sh PATH)
+                        run              process files from index
+                        "
                     )
                 );
             }
