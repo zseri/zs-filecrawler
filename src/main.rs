@@ -1,10 +1,8 @@
-#[macro_use]
-extern crate log;
-
 use digest::Digest;
 use generic_array::{typenum::U32, GenericArray};
 use hashbrown::{HashMap, HashSet};
 use indoc::indoc;
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::{
     io::{BufRead, Write},
@@ -14,7 +12,7 @@ use std::{
         Arc,
     },
 };
-use text_io::{read, try_read, try_scan};
+use text_io::read;
 
 mod signals;
 use signals::*;
@@ -25,8 +23,7 @@ fn logger_init() {
         LevelFilter::Info,
         Config::default(),
         TerminalMode::Mixed,
-    )
-    .unwrap()])
+    )])
     .unwrap();
 }
 
@@ -150,8 +147,8 @@ fn idx_ingest(
         return false;
     }
     let sigdat = sigdat.disarm_aquire();
-    let mut stdout = std::io::stdout();
     let mut hasher = sha2::Sha256::new();
+    let mut stdout = std::io::stdout();
     let mut cnt_plus: usize = 0;
     let mut cnt_alr: usize = 0;
     let mut cnt_dup: usize = 0;
@@ -180,8 +177,8 @@ fn idx_ingest(
             warn!("Unable to open input file ({}: {})", ril, x);
             continue;
         }
-        hasher.input(fh2.unwrap().as_slice());
-        let ent = idxd.entry(hasher.result_reset()).or_insert(IndexEntry {
+        hasher.update(fh2.unwrap().as_slice());
+        let ent = idxd.entry(hasher.finalize_reset()).or_insert(IndexEntry {
             is_fin: false,
             paths: HashSet::new(),
         });

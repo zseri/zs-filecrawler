@@ -1,3 +1,4 @@
+use log::warn;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -37,9 +38,7 @@ impl SignalDataIntern {
     }
     pub fn disarm_aquire(&self) -> SignalDataUnArmed<'_> {
         self.set_ctrlc_armed(false);
-        SignalDataUnArmed {
-            parent: self,
-        }
+        SignalDataUnArmed { parent: self }
     }
 }
 
