@@ -1,21 +1,27 @@
+mod signals;
+
+use crate::signals::*;
 use digest::Digest;
-use generic_array::{typenum::U32, GenericArray};
-use hashbrown::{HashMap, HashSet};
 use indoc::indoc;
-use log::{error, info, warn};
-use serde::{Deserialize, Serialize};
+use log::error;
 use std::{
     io::{BufRead, Write},
+    mem::drop,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::Arc,
+    time::Duration,
 };
 use text_io::read;
 
-mod signals;
-use signals::*;
+mod dbkeys {
+    pub const HOOK: &[u8] = b"hook";
+    pub const MAX_FSIZ: &[u8] = b"max-filesize";
+    pub const USE_MP: &[u8] = b"use-mp";
+}
+
+mod dbtrees {
+    pub const HASHES: &[u8] = b"hashes";
+}
 
 fn logger_init() {
     use simplelog::*;
@@ -38,222 +44,220 @@ fn read_from_file<P: AsRef<Path>>(path: P) -> std::io::Result<readfilez::FileHan
     readfilez::read_from_file(std::fs::File::open(path))
 }
 
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
-struct IndexEntry {
-    is_fin: bool,
-    paths: HashSet<String>,
+fn handle_dbres<T>(x: Result<T, sled::Error>) -> Option<T> {
+    x.map_err(|e| {
+        error!("{}", e);
+    })
+    .ok()
 }
 
-type Index = HashMap<GenericArray<u8, U32>, IndexEntry>;
-
-#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
-struct ProgStateDetail {
-    hook: PathBuf,
-    idxd: Index,
-    idx_max_filesize: Option<u64>,
-    use_multiproc: bool,
-}
-
-#[derive(Clone, Debug)]
-struct ProgState {
-    inpf_prefix: PathBuf,
-    sfile: PathBuf,
-    detail: ProgStateDetail,
-    modified: bool,
-}
-
-impl ProgStateDetail {
-    fn run(&mut self, sigdat: &SignalData) {
-        use rayon::prelude::*;
-        let n = AtomicUsize::new(0);
-        let nmax = AtomicUsize::new(self.idxd.len());
-        let hook = &self.hook;
-        let nunit: usize = std::cmp::max(10, self.idxd.len() / 1000);
-        let sigdat = sigdat.disarm_aquire();
-
-        let worker = |cs, ixe: &mut IndexEntry| {
-            if ixe.is_fin || ixe.paths.is_empty() {
-                nmax.fetch_sub(1, Ordering::SeqCst);
-                return;
+fn does_exceed_max_filesize(filename: &Path, idx_max_filesize: Option<u64>) -> bool {
+    if let Some(max_fsiz) = idx_max_filesize {
+        if let Ok(fmd) = std::fs::metadata(filename) {
+            if fmd.len() > max_fsiz {
+                return true;
             }
-            if n.load(Ordering::SeqCst) % nunit == 0 {
-                info!(
-                    "[{}%]",
-                    (n.load(Ordering::SeqCst) * 100) / nmax.load(Ordering::SeqCst)
-                );
-            }
-            n.fetch_add(1, Ordering::SeqCst);
-            let cshex = hex::encode(cs);
-            for path in &ixe.paths {
-                if sigdat.got_ctrlc() {
-                    break;
+        }
+    }
+    false
+}
+
+fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::Error> {
+    use crossbeam_channel as chan;
+    use indicatif::ProgressBar;
+
+    let max_filesize: Option<u64> = db.get(dbkeys::MAX_FSIZ)?.and_then(|iv| {
+        let mut buf = [0u8; 8];
+        if iv.len() != buf.len() {
+            return None;
+        }
+        buf.copy_from_slice(&iv[..]);
+        Some(u64::from_le_bytes(buf))
+    });
+
+    if does_exceed_max_filesize(ingestf, max_filesize) {
+        error!("File is too big: {}", ingestf.display());
+        return Ok(());
+    }
+
+    let fh = read_from_file(ingestf);
+    if let Err(x) = &fh {
+        error!("Unable to open input file ({}: {})", ingestf.display(), x);
+        return Ok(());
+    }
+
+    let wcnt: usize = if db.get(dbkeys::USE_MP)?.is_some() {
+        match num_cpus::get() {
+            0 => 1,
+            x => x,
+        }
+    } else {
+        1
+    };
+
+    let hook = Arc::new(match db.get(dbkeys::HOOK)? {
+        Some(h) => {
+            let p = match std::str::from_utf8(&*h) {
+                Ok(x) => Path::new(x),
+                Err(x) => {
+                    error!("Invalid hook in DB (non-utf8): error = {}", x);
+                    return Ok(());
                 }
-                println!("{} {}", cshex, path);
-                let cmdres = std::process::Command::new(hook).arg(path).status();
-                match cmdres {
-                    Ok(x) if x.success() => {
-                        ixe.is_fin = true;
+            };
+            if !p.is_file() {
+                error!("Hook not found: {}", p.display());
+                return Ok(());
+            }
+            p.to_path_buf()
+        }
+        None => {
+            error!("No hook set!");
+            return Ok(());
+        }
+    });
+
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&*read_from_file(hook.as_path()).expect("unable to read hook file"));
+    let hook_hash = sled::IVec::from(&*hasher.finalize_reset());
+
+    let (iwq, workqueue) = chan::bounded(2 * wcnt + 1);
+    let sigdat = sigdat.disarm_aquire();
+    let mpbs = indicatif::MultiProgress::new();
+
+    let pbstyle = indicatif::ProgressStyle::default_spinner()
+        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+        .template("[{elapsed_precise}] {prefix:.bold.dim} {spinner} {wide_msg}");
+    let ipb = ProgressBar::new_spinner();
+    ipb.set_style(pbstyle);
+    let ipb = mpbs.add(ipb);
+    let sigdat = Arc::new(sigdat);
+
+    crossbeam_utils::thread::scope(move |s| {
+        {
+            let sigdat = sigdat.clone();
+            s.spawn(move |_| {
+                let mut cnt_plus: usize = 0;
+
+                for ingline in fh.unwrap().as_slice().lines() {
+                    if sigdat.got_ctrlc() {
                         break;
                     }
-                    _ => {
-                        warn!("HOOK failed with {:?}", cmdres);
+                    if let Err(x) = &ingline {
+                        ipb.println(format!("Got invalid line: ERROR: {}", x));
+                        continue;
                     }
+                    let ril = ingline.unwrap();
+                    let ril = ril.trim_start();
+                    if ril.is_empty() || ril.bytes().next().unwrap() == b'#' {
+                        continue;
+                    }
+                    if does_exceed_max_filesize(Path::new(ril), max_filesize) {
+                        ipb.println(format!("File is too big: {}", ril));
+                        continue;
+                    }
+                    let fh2 = read_from_file(ril);
+                    if let Err(x) = &fh2 {
+                        ipb.println(format!("Unable to open input file ({}: {})", ril, x));
+                        continue;
+                    }
+                    hasher.update(fh2.unwrap().as_slice());
+                    let hash = hasher.finalize_reset();
+                    cnt_plus += 1;
+                    ipb.set_message(&format!(
+                        "ingest {}: {} with hash {}",
+                        cnt_plus,
+                        ril,
+                        hex::encode(&hash)
+                    ));
+                    iwq.send((Path::new(ril).to_path_buf(), hash)).unwrap();
                 }
-            }
-        };
-
-        if self.use_multiproc {
-            self.idxd.par_iter_mut().for_each(|(cs, ixe)| {
-                if sigdat.got_ctrlc() {
-                    return;
-                }
-                worker(cs, ixe);
+                ipb.finish_and_clear();
             });
-        } else {
-            for (cs, ixe) in &mut self.idxd {
+        }
+
+        let pbstyle = indicatif::ProgressStyle::default_spinner()
+            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+            .template("{prefix:.bold.dim} {spinner} {len} {wide_msg}");
+        let thashes = db
+            .open_tree(dbtrees::HASHES)
+            .expect("unable to open hashes tree");
+
+        for _ in 0..wcnt {
+            let pb = indicatif::ProgressBar::new(0);
+            pb.set_style(pbstyle.clone());
+            let pb = mpbs.add(pb);
+            let workqueue = workqueue.clone();
+            let thashes = thashes.clone();
+            let hook = hook.clone();
+            let hook_hash = hook_hash.clone();
+            let sigdat = sigdat.clone();
+            s.spawn(move |_| loop {
                 if sigdat.got_ctrlc() {
+                    pb.abandon();
                     break;
                 }
-                worker(cs, ixe);
-            }
-        }
-    }
-}
+                pb.tick();
+                match workqueue.recv_timeout(Duration::from_secs(1)) {
+                    Err(chan::RecvTimeoutError::Timeout) => continue,
+                    Err(chan::RecvTimeoutError::Disconnected) => break,
+                    Ok((f, h)) => {
+                        pb.inc_length(1);
+                        let h3 = hex::encode(&*h);
 
-fn idx_ingest(
-    idxd: &mut Index,
-    sigdat: &SignalData,
-    filename: &Path,
-    idx_max_filesize: Option<u64>,
-) -> bool {
-    fn does_exceed_max_filesize(filename: &Path, idx_max_filesize: Option<u64>) -> bool {
-        if let Some(max_fsiz) = &idx_max_filesize {
-            if let Ok(fmd) = std::fs::metadata(filename) {
-                if fmd.len() > *max_fsiz {
-                    return true;
+                        if thashes
+                            .get(&*h)
+                            .expect("unable to retrieve hash data")
+                            .as_ref()
+                            != Some(&hook_hash)
+                        {
+                            use std::process as prc;
+                            pb.set_message(&format!("hash {} file {}: run", h3, f.display()));
+
+                            match prc::Command::new(hook.as_path())
+                                .arg(&f)
+                                .stdin(prc::Stdio::null())
+                                .output()
+                            {
+                                Ok(mut  x) if x.status.success() => {
+                                    thashes
+                                        .insert(&*h, hook_hash.clone())
+                                        .expect("unable to update hash data");
+                                    x.stderr.extend_from_slice(&x.stdout[..]);
+                                    if let Ok(x) = std::str::from_utf8(&x.stderr) {
+                                        for i in x.lines() {
+                                            pb.println(i);
+                                        }
+                                    } else {
+                                        let mut stderr = std::io::stderr();
+                                        stderr.write_all(&x.stderr).unwrap();
+                                    }
+                                    break;
+                                }
+                                cmdres => {
+                                    pb.println(format!(
+                                        "{}, HOOK failed with {:?}",
+                                        f.display(),
+                                        cmdres
+                                    ));
+                                }
+                            }
+                        } else {
+                            pb.set_message(&format!("hash {} file {}: skipped", h3, f.display()));
+                        }
+                        pb.inc(1);
+                    }
                 }
-            }
+            });
         }
-        false
-    }
-
-    if does_exceed_max_filesize(filename, idx_max_filesize) {
-        error!("File is too big: {}", filename.display());
-        return false;
-    }
-    let fh = read_from_file(filename);
-    if let Err(x) = &fh {
-        error!("Unable to open input file ({}: {})", filename.display(), x);
-        return false;
-    }
-    let sigdat = sigdat.disarm_aquire();
-    let mut hasher = sha2::Sha256::new();
-    let mut stdout = std::io::stdout();
-    let mut cnt_plus: usize = 0;
-    let mut cnt_alr: usize = 0;
-    let mut cnt_dup: usize = 0;
-    let mut cnt_fin: usize = 0;
-    for ingline in fh.unwrap().as_slice().lines() {
-        if sigdat.got_ctrlc() {
-            break;
-        }
-        if let Err(x) = &ingline {
-            writeln!(stdout).unwrap();
-            warn!("Got invalid line: {}", x);
-            continue;
-        }
-        let ril = ingline.unwrap();
-        let ril = ril.trim_start();
-        if ril.is_empty() || ril.bytes().nth(0).unwrap() == b'#' {
-            continue;
-        }
-        if does_exceed_max_filesize(Path::new(ril), idx_max_filesize) {
-            error!("File is too big: {}", ril);
-            continue;
-        }
-        let fh2 = read_from_file(ril);
-        if let Err(x) = &fh2 {
-            writeln!(stdout).unwrap();
-            warn!("Unable to open input file ({}: {})", ril, x);
-            continue;
-        }
-        hasher.update(fh2.unwrap().as_slice());
-        let ent = idxd.entry(hasher.finalize_reset()).or_insert(IndexEntry {
-            is_fin: false,
-            paths: HashSet::new(),
-        });
-        if ent.is_fin {
-            cnt_fin += 1;
-        } else {
-            let len_before = ent.paths.len();
-            cnt_plus += 1;
-            ent.paths.insert(ril.to_string());
-            let len_after = ent.paths.len();
-            *(if len_before == len_after {
-                &mut cnt_alr
-            } else if len_after > 1 {
-                &mut cnt_dup
-            } else {
-                &mut cnt_plus
-            }) += 1;
-        }
-        stdout.flush().unwrap();
-        write!(
-            stdout,
-            "\r{} inserted / {} skipped / {} DUP / {} finished",
-            cnt_plus, cnt_alr, cnt_dup, cnt_fin
-        )
-        .unwrap();
-    }
-    writeln!(stdout).unwrap();
-    true
-}
-
-impl ProgState {
-    // resolve $x accoording to self.inpf_prefix
-    fn resolve_path(&self, x: &str) -> PathBuf {
-        if Path::new(x).is_relative() {
-            self.inpf_prefix.join(x)
-        } else {
-            PathBuf::from(x)
-        }
-    }
-
-    fn load_from_sfile(&mut self) -> Result<(), String> {
-        let fh = read_from_file(&self.sfile)
-            .map_err(|x| format!("Unable to open sfile ({}: {})", self.sfile.display(), x))?;
-        let z = flate2::read::DeflateDecoder::new(fh.as_slice());
-        self.detail = bincode::deserialize_from(z)
-            .map_err(|x| format!("Unable to read sfile ({}: {})", self.sfile.display(), x))?;
-        self.modified = false;
-        Ok(())
-    }
-
-    fn save_to_sfile(&mut self) -> Result<(), String> {
-        let fh = std::fs::File::create(&self.sfile)
-            .map_err(|x| format!("Failed to create sfile ({}: {})", self.sfile.display(), x))?;
-        let z = flate2::write::DeflateEncoder::new(fh, flate2::Compression::default());
-        bincode::serialize_into(z, &self.detail)
-            .map_err(|x| format!("Failed to write sfile ({}: {})", self.sfile.display(), x))?;
-        self.modified = false;
-        Ok(())
-    }
-
-    // fnx(ixe) -> bool :: @return : keep if true
-    fn idx_gc<FnT: Fn(&IndexEntry) -> bool>(&mut self, fnx: FnT) {
-        use rayon::prelude::*;
-
-        self.modified = true;
-        self.detail.idxd.par_iter_mut().for_each(|(_, ixe)| {
-            if ixe.is_fin {
-                ixe.paths.clear();
-            } else {
-                ixe.paths.retain(|f| Path::new(f).is_file());
-            }
-            ixe.paths.shrink_to_fit();
-        });
-        self.detail.idxd.retain(|_, ixe| fnx(ixe));
-    }
+        drop(workqueue);
+        mpbs.join().unwrap();
+    })
+    .map_err(|_| {
+        sled::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "run terminated unexpectedly",
+        ))
+    })
 }
 
 fn main() {
@@ -263,24 +267,26 @@ fn main() {
     register_signal_handlers(sigdat.clone());
 
     let mut stdout = std::io::stdout();
+    let mut dbpath = PathBuf::from("zsfc-progstate");
 
-    let mut pstate = ProgState {
-        inpf_prefix: PathBuf::from("."),
-        sfile: PathBuf::from("progstate.txt"),
-        detail: ProgStateDetail {
-            hook: PathBuf::from("hook.sh"),
-            idxd: HashMap::new(),
-            idx_max_filesize: None,
-            use_multiproc: false,
-        },
-        modified: false,
-    };
+    if let Some(dbf) = std::env::args().nth(1) {
+        if dbf == "--help" {
+            writeln!(stdout, "USAGE: zs-filecrawler [DB_PATH]").unwrap();
+            std::process::exit(0);
+        }
+        dbpath = dbf.into()
+    }
+
+    let dbt = sled::open(dbpath).expect("unable to open database");
+
+    let thashes = dbt
+        .open_tree(dbtrees::HASHES)
+        .expect("unable to open hash² map");
 
     loop {
         // disable catching of Ctrl-C
         sigdat.set_ctrlc_armed(true);
-        let prompt_ptext = if pstate.modified { "*" } else { " " };
-        write!(stdout, "zs-filecrawler {}>> ", prompt_ptext).unwrap();
+        write!(stdout, "zs-filecrawler >> ").unwrap();
         stdout.flush().unwrap();
 
         let line: String = read!("{}\n");
@@ -288,44 +294,9 @@ fn main() {
 
         match line {
             "exit" | "quit" => {
-                if pstate.modified {
-                    error!("you have modified data... call 's:clear-modified-flag' OR 's:save' before exiting");
-                } else {
-                    break;
-                }
-            }
-            "s:clear-modified-flag" => {
-                pstate.modified = false;
-            }
-            "s:load" => {
-                if pstate.modified {
-                    error!("you have modified data... call 's:clear-modified-flag' OR 's:save' before loading");
-                } else if let Err(x) = pstate.load_from_sfile() {
-                    error!("{}", x);
-                }
-            }
-            "s:save" => {
-                if let Err(x) = pstate.save_to_sfile() {
-                    error!("{}", x);
-                }
-            }
-            "i:print-debug" => {
-                for (cs, ixe) in &pstate.detail.idxd {
-                    println!("{} {} {:?}", hex::encode(cs), ixe.is_fin, ixe.paths);
-                }
-            }
-            "i:clear" => {
-                pstate.modified = true;
-                pstate.detail.idxd.clear();
-            }
-            "i:clear-unfin" => {
-                pstate.idx_gc(|ixe| ixe.is_fin);
-            }
-            "i:gc" => {
-                pstate.idx_gc(|ixe| !ixe.paths.is_empty() || ixe.is_fin);
-            }
-            "i:gc-aggressive" => {
-                pstate.idx_gc(|ixe| !ixe.paths.is_empty() && !ixe.is_fin);
+                handle_dbres(thashes.flush());
+                handle_dbres(dbt.flush());
+                break;
             }
             "help" => {
                 println!(
@@ -334,35 +305,37 @@ fn main() {
                         "
                         Commands:
                         exit | quit      exit this program without saving
-                        set-inpf-prefix D use a different directory than the current to
-                                         resolve paths @:
-                                             - s:set-file
-                                             - h:set
-                                             - i:ingest (only the argument to ingest,
-                                                 not the content of the ingest file)
-                        i:set-max-filesize SIZ|none
+                        clear            clear the hash² db table
+                        dprint           print the hash² db table
+                        flush            sync db data to disk
+
+                        set-max-filesize SIZ|none
                                          skip any file with a length greater than SIZ
-                        s:load           load state from sfile (defaults to 'progstate.txt')
-                        s:save           save state to sfile
-                        s:set-file FILE  change used sfile to FILE
-                        s:use-mp y|n     enable/disable parallel hook runs
-                        i:clear          clear the index
-                        i:clear-unfin    clear all unfinished index entries
-                        i:gc             run index garbage-collection (drop missing files
-                                             and entries without associated files)
-                        i:gc-aggressive  run index garbage-collection (drop already finished
-                                             entries and entries without associated files)
-                        i:ingest FILE    read file paths from FILE (advice: use absolute paths)
-                        i:print-debug    print the whole index
-                        h:set FILE       set used hook (USAGE: ./hook.sh PATH)
-                        run              process files from index
+                        use-mp y|n       enable/disable parallel hook runs
+                        set-hook FILE    set used hook (USAGE: ./hook.sh PATH)
+                        run FILE         process files from index, read file paths from FILE
+                                         (advice: use absolute paths)
+                                         This processing is interruptable with Ctrl+C.
+
+                        If you want to set the database path, you must specify it
+                            as the first command line argument to zs-filecrawler.
                         "
                     )
                 );
             }
-            "run" => {
-                pstate.modified = true;
-                pstate.detail.run(&sigdat);
+            "clear" => {
+                handle_dbres(thashes.clear());
+            }
+            "dprint" => {
+                for x in thashes.iter() {
+                    if let Some((k, v)) = handle_dbres(x) {
+                        println!("{} via {}", hex::encode(&*k), hex::encode(&*v));
+                    }
+                }
+            }
+            "flush" => {
+                handle_dbres(thashes.flush());
+                handle_dbres(dbt.flush());
             }
             _ => {
                 let (cmd, rest) = split_command(line);
@@ -372,18 +345,22 @@ fn main() {
                     continue;
                 }
                 match cmd {
-                    "set-inpf-prefix" => {
-                        pstate.inpf_prefix = PathBuf::from(rest);
+                    "use-mp" => {
+                        handle_dbres(match rest {
+                            "Y" | "y" | "yes" => dbt.insert(dbkeys::USE_MP, &[]),
+                            "N" | "n" | "no" => dbt.remove(dbkeys::USE_MP),
+                            _ => {
+                                error!("unknown specifier");
+                                continue;
+                            }
+                        });
                     }
-                    "s:set-file" => {
-                        pstate.sfile = pstate.resolve_path(rest);
+                    "set-hook" => {
+                        handle_dbres(dbt.insert(dbkeys::HOOK, rest));
                     }
-                    "h:set" => {
-                        pstate.detail.hook = pstate.resolve_path(rest);
-                    }
-                    "i:set-max-filesize" => {
+                    "set-max-filesize" => {
                         if rest == "none" {
-                            pstate.detail.idx_max_filesize = None;
+                            handle_dbres(dbt.remove(dbkeys::MAX_FSIZ));
                             continue;
                         }
                         let bytes_cnt = match byte_unit::Byte::from_str(rest) {
@@ -397,24 +374,13 @@ fn main() {
                             error!("Given byte unit value is too big: {}", rest);
                             continue;
                         }
-                        pstate.detail.idx_max_filesize = Some(bytes_cnt as u64);
+                        handle_dbres(
+                            dbt.insert(dbkeys::MAX_FSIZ, &(bytes_cnt as u64).to_le_bytes()),
+                        );
                     }
-                    "i:ingest" => {
-                        let ingest_inf = pstate.resolve_path(rest);
-                        if idx_ingest(
-                            &mut pstate.detail.idxd,
-                            &sigdat,
-                            &ingest_inf,
-                            pstate.detail.idx_max_filesize,
-                        ) {
-                            pstate.modified = true;
-                        }
+                    "run" => {
+                        handle_dbres(run(&dbt, &sigdat, Path::new(rest)));
                     }
-                    "s:use-mp" => match rest {
-                        "Y" | "y" | "yes" => pstate.detail.use_multiproc = true,
-                        "N" | "n" | "no" => pstate.detail.use_multiproc = false,
-                        _ => error!("unknown specifier"),
-                    },
                     _ => {
                         error!("Unknown command!");
                     }

@@ -56,9 +56,9 @@ impl Drop for SignalDataUnArmed<'_> {
 
 pub fn register_signal_handlers(dat: SignalData) {
     unsafe { signal_hook::register(signal_hook::SIGINT, move || dat.handle_ctrlc()) }
-        .or_else(|e| {
+        .map_err(|e| {
             warn!("Failed to register for SIGINT {:?}", e);
-            Err(e)
+            e
         })
         .ok();
 }
