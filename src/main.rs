@@ -121,7 +121,7 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
     let hook_hash = sled::IVec::from(&*hasher.finalize_reset());
 
     let (iwq, workqueue) = chan::bounded(2 * wcnt + 1);
-    let sigdat = sigdat.disarm_aquire();
+    let sigdat = Arc::new(sigdat.disarm_aquire());
     let mpbs = indicatif::MultiProgress::new();
 
     let pbstyle = indicatif::ProgressStyle::default_spinner()
@@ -130,7 +130,6 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
     let ipb = ProgressBar::new_spinner();
     ipb.set_style(pbstyle);
     let ipb = mpbs.add(ipb);
-    let sigdat = Arc::new(sigdat);
 
     crossbeam_utils::thread::scope(move |s| {
         {
@@ -148,7 +147,10 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
                     }
                     let ril = ingline.unwrap();
                     let ril = ril.trim_start();
-                    if ril.is_empty() || ril.bytes().next().unwrap() == b'#' {
+                    if ril.is_empty()
+                        || ril.bytes().next().unwrap() == b'#'
+                        || !Path::new(ril).is_file()
+                    {
                         continue;
                     }
                     if does_exceed_max_filesize(Path::new(ril), max_filesize) {
@@ -191,62 +193,69 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
             let hook = hook.clone();
             let hook_hash = hook_hash.clone();
             let sigdat = sigdat.clone();
-            s.spawn(move |_| loop {
-                if sigdat.got_ctrlc() {
-                    pb.abandon();
-                    break;
-                }
-                pb.tick();
-                match workqueue.recv_timeout(Duration::from_secs(1)) {
-                    Err(chan::RecvTimeoutError::Timeout) => continue,
-                    Err(chan::RecvTimeoutError::Disconnected) => break,
-                    Ok((f, h)) => {
-                        pb.inc_length(1);
-                        let h3 = hex::encode(&*h);
+            s.spawn(move |_| {
+                loop {
+                    if sigdat.got_ctrlc() {
+                        pb.abandon();
+                        break;
+                    }
+                    pb.tick();
+                    match workqueue.recv_timeout(Duration::from_secs(1)) {
+                        Err(chan::RecvTimeoutError::Timeout) => continue,
+                        Err(chan::RecvTimeoutError::Disconnected) => break,
 
-                        if thashes
-                            .get(&*h)
-                            .expect("unable to retrieve hash data")
-                            .as_ref()
-                            != Some(&hook_hash)
-                        {
-                            use std::process as prc;
-                            pb.set_message(&format!("hash {} file {}: run", h3, f.display()));
+                        Ok((f, h)) => {
+                            pb.inc_length(1);
+                            let h3 = hex::encode(&*h);
 
-                            match prc::Command::new(hook.as_path())
-                                .arg(&f)
-                                .stdin(prc::Stdio::null())
-                                .output()
+                            if thashes
+                                .get(&*h)
+                                .expect("unable to retrieve hash data")
+                                .as_ref()
+                                != Some(&hook_hash)
                             {
-                                Ok(mut  x) if x.status.success() => {
-                                    thashes
-                                        .insert(&*h, hook_hash.clone())
-                                        .expect("unable to update hash data");
-                                    x.stderr.extend_from_slice(&x.stdout[..]);
-                                    if let Ok(x) = std::str::from_utf8(&x.stderr) {
-                                        for i in x.lines() {
-                                            pb.println(i);
+                                use std::process as prc;
+                                pb.set_message(&format!("hash {} file {}: run", h3, f.display()));
+
+                                match prc::Command::new(hook.as_path())
+                                    .arg(&f)
+                                    .stdin(prc::Stdio::null())
+                                    .output()
+                                {
+                                    Ok(mut x) if x.status.success() => {
+                                        thashes
+                                            .insert(&*h, hook_hash.clone())
+                                            .expect("unable to update hash data");
+                                        x.stderr.extend_from_slice(&x.stdout[..]);
+                                        if let Ok(x) = std::str::from_utf8(&x.stderr) {
+                                            for i in x.lines() {
+                                                pb.println(i);
+                                            }
+                                        } else {
+                                            let mut stderr = std::io::stderr();
+                                            stderr.write_all(&x.stderr).unwrap();
                                         }
-                                    } else {
-                                        let mut stderr = std::io::stderr();
-                                        stderr.write_all(&x.stderr).unwrap();
                                     }
-                                    break;
+                                    cmdres => {
+                                        pb.println(format!(
+                                            "{}, HOOK failed with {:?}",
+                                            f.display(),
+                                            cmdres
+                                        ));
+                                    }
                                 }
-                                cmdres => {
-                                    pb.println(format!(
-                                        "{}, HOOK failed with {:?}",
-                                        f.display(),
-                                        cmdres
-                                    ));
-                                }
+                            } else {
+                                pb.set_message(&format!(
+                                    "hash {} file {}: skipped",
+                                    h3,
+                                    f.display()
+                                ));
                             }
-                        } else {
-                            pb.set_message(&format!("hash {} file {}: skipped", h3, f.display()));
+                            pb.inc(1);
                         }
-                        pb.inc(1);
                     }
                 }
+                pb.finish();
             });
         }
         drop(workqueue);
