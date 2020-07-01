@@ -18,7 +18,7 @@ mod dbkeys {
 }
 
 mod dbtrees {
-    pub const HASHES: &[u8] = b"hashes";
+    pub const HASHES_: &[u8] = b"hashes:";
 }
 
 #[inline]
@@ -31,6 +31,18 @@ fn handle_dbres<T>(x: Result<T, sled::Error>) -> Option<T> {
         error!("{}", e);
     })
     .ok()
+}
+
+fn foreach_hashes_tree<F>(dbt: &sled::Db, mut f: F) -> Result<(), sled::Error>
+where
+    F: FnMut(&[u8], sled::Tree) -> Result<(), sled::Error>,
+{
+    for x in dbt.tree_names() {
+        if x.starts_with(dbtrees::HASHES_) {
+            f(&x[dbtrees::HASHES_.len()..], dbt.open_tree(&x)?)?;
+        }
+    }
+    Ok(())
 }
 
 fn main() {
@@ -66,10 +78,6 @@ fn main() {
         .open()
         .expect("unable to open database");
 
-    let thashes = dbt
-        .open_tree(dbtrees::HASHES)
-        .expect("unable to open hash² map");
-
     loop {
         // disable catching of Ctrl-C
         sigdat.set_ctrlc_armed(true);
@@ -81,7 +89,6 @@ fn main() {
 
         match line {
             "exit" | "quit" => {
-                handle_dbres(thashes.flush());
                 handle_dbres(dbt.flush());
                 break;
             }
@@ -111,17 +118,24 @@ fn main() {
                 );
             }
             "clear" => {
-                handle_dbres(thashes.clear());
-            }
-            "dprint" => {
-                for x in thashes.iter() {
-                    if let Some((k, v)) = handle_dbres(x) {
-                        println!("{} via {}", hex::encode(&*k), hex::encode(&*v));
+                for x in dbt.tree_names() {
+                    if x.starts_with(dbtrees::HASHES_) {
+                        handle_dbres(dbt.drop_tree(&x));
                     }
                 }
             }
+            "dprint" => {
+                handle_dbres(foreach_hashes_tree(&dbt, |tname, t| {
+                    println!("via {}:", hex::encode(tname));
+                    for x in t.iter() {
+                        if let Some((k, _)) = handle_dbres(x) {
+                            println!("\t{}", hex::encode(&*k));
+                        }
+                    }
+                    Ok(())
+                }));
+            }
             "flush" => {
-                handle_dbres(thashes.flush());
                 handle_dbres(dbt.flush());
             }
             _ => {

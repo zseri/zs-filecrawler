@@ -5,17 +5,6 @@ use indicatif::ProgressBar;
 use log::error;
 use std::{convert::TryInto, io::Write, mem::drop, path::Path, time::Duration};
 
-fn does_exceed_max_filesize(filename: &Path, idx_max_filesize: Option<u64>) -> bool {
-    if let Some(max_fsiz) = idx_max_filesize {
-        if let Ok(fmd) = std::fs::metadata(filename) {
-            if fmd.len() > max_fsiz {
-                return true;
-            }
-        }
-    }
-    false
-}
-
 struct DoneQueueItem<'a> {
     file: &'a Path,
     msg: Vec<u8>,
@@ -24,7 +13,6 @@ struct DoneQueueItem<'a> {
 fn worker<'a>(
     sigdat: &SignalDataUnArmed,
     hook: &Path,
-    hook_hash: &sled::IVec,
     thashes: &sled::Tree,
     pb: ProgressBar,
     workqueue: chan::Receiver<&'a Path>,
@@ -60,6 +48,7 @@ fn worker<'a>(
                 if fh2.len() > 40_960 {
                     pb.set_message(&format!("file {}: calculate hash", f.display()));
                 }
+
                 hasher.update(fh2.as_slice());
                 let h = hasher.finalize_reset();
                 drop(fh2);
@@ -71,7 +60,7 @@ fn worker<'a>(
                     .get(&*h)
                     .expect("unable to retrieve hash data")
                     .as_ref()
-                    != Some(hook_hash)
+                    .is_none()
                 {
                     use std::process as prc;
                     pb.set_message(&format!("hash {} file {}: run", h3, f.display()));
@@ -83,7 +72,7 @@ fn worker<'a>(
                     {
                         Ok(mut x) if x.status.success() => {
                             thashes
-                                .insert(&*h, hook_hash)
+                                .insert(&*h, &[])
                                 .expect("unable to update hash data");
                             x.stderr.extend_from_slice(&x.stdout[..]);
                             msg = x.stderr;
@@ -104,6 +93,15 @@ fn worker<'a>(
     pb.finish();
 }
 
+fn does_exceed_max_filesize(fmd: &std::fs::Metadata, idx_max_filesize: Option<u64>) -> bool {
+    if let Some(max_fsiz) = idx_max_filesize {
+        if fmd.len() > max_fsiz {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::Error> {
     let max_filesize: Option<u64> = db.get(dbkeys::MAX_FSIZ)?.and_then(|iv| {
         let mut buf = [0u8; 8];
@@ -114,7 +112,7 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
         Some(u64::from_le_bytes(buf))
     });
 
-    if does_exceed_max_filesize(ingestf, max_filesize) {
+    if does_exceed_max_filesize(&std::fs::metadata(ingestf)?, max_filesize) {
         error!("File is too big: {}", ingestf.display());
         return Ok(());
     }
@@ -162,18 +160,21 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
     };
     let hook = hook.as_path();
 
-    let thashes = db
-        .open_tree(dbtrees::HASHES)
-        .expect("unable to open hashes tree");
-    let thashes = &thashes;
-
     let mut hasher = sha2::Sha256::new();
     hasher.update(&*read_from_file(hook).expect("unable to read hook file"));
     let hook_hash = sled::IVec::from(&*hasher.finalize_reset());
     let hook_hash = &hook_hash;
 
-    let (iwq, workqueue) = chan::bounded(100 * wcnt);
-    let (idnq, dnq) = chan::bounded::<DoneQueueItem>(100 * wcnt);
+    let thashes: Vec<u8> = dbtrees::HASHES_
+        .iter()
+        .chain(hook_hash.iter())
+        .map(|i| *i)
+        .collect();
+    let thashes = db.open_tree(thashes).expect("unable to open hashes tree");
+    let thashes = &thashes;
+
+    let (iwq, workqueue) = chan::bounded(4096 * wcnt);
+    let (idnq, dnq) = chan::bounded::<DoneQueueItem>(1024 * wcnt);
     let sigdat = sigdat.disarm_aquire();
     let sigdat = &sigdat;
     let mpbs = indicatif::MultiProgress::new();
@@ -181,12 +182,12 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
     crossbeam_utils::thread::scope(move |s| {
         {
             let fpb = ProgressBar::new(fh.lines().count().try_into().unwrap());
-            fpb.set_style(
-                indicatif::ProgressStyle::default_bar()
-                    .template("{prefix:.bold.dim} [{elapsed_precise}] {wide_bar} {pos}/{len} eta {eta}"),
-            );
+            fpb.set_style(indicatif::ProgressStyle::default_bar().template(
+                "{prefix:.bold.dim} [{elapsed_precise}] {wide_bar} eta {eta} {pos}/{len}",
+            ));
             fpb.set_prefix(" done ");
             let fpb = mpbs.add(fpb);
+
             s.spawn(move |_| {
                 let mut stderr = std::io::stderr();
                 while let Ok(x) = dnq.recv() {
@@ -220,10 +221,9 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
             let idnq = idnq.clone();
 
             let ipb = ProgressBar::new(fh.lines().count().try_into().unwrap());
-            ipb.set_style(
-                indicatif::ProgressStyle::default_bar()
-                    .template("{prefix:.bold.dim} [{elapsed_precise}] {wide_bar} {pos}/{len}"),
-            );
+            ipb.set_style(indicatif::ProgressStyle::default_bar().template(
+                "{prefix:.bold.dim} [{elapsed_precise}] {wide_bar} eta {eta} {pos}/{len}",
+            ));
             ipb.set_prefix("ingest");
             let ipb = mpbs.add(ipb);
             let ips = ProgressBar::new_spinner();
@@ -250,7 +250,18 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
                         .unwrap();
                         continue;
                     }
-                    if does_exceed_max_filesize(rilp, max_filesize) {
+                    let meta = match std::fs::metadata(rilp) {
+                        Ok(x) => x,
+                        Err(x) => {
+                            idnq.send(DoneQueueItem {
+                                file: rilp,
+                                msg: format!("unable to read file metadata: {}", x).into_bytes(),
+                            })
+                            .unwrap();
+                            continue;
+                        }
+                    };
+                    if does_exceed_max_filesize(&meta, max_filesize) {
                         idnq.send(DoneQueueItem {
                             file: rilp,
                             msg: "file is too big".to_string().into_bytes(),
@@ -278,7 +289,7 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
             let pb = mpbs.add(pb);
             let workqueue = workqueue.clone();
             let idnq = idnq.clone();
-            s.spawn(move |_| worker(sigdat, hook, hook_hash, thashes, pb, workqueue, idnq));
+            s.spawn(move |_| worker(sigdat, hook, thashes, pb, workqueue, idnq));
         }
         drop(workqueue);
         drop(idnq);
