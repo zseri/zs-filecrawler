@@ -13,7 +13,9 @@ use text_io::read;
 
 mod dbkeys {
     pub const HOOK: &[u8] = b"hook";
+    pub const LOGFILE: &[u8] = b"logfile";
     pub const MAX_FSIZ: &[u8] = b"max-filesize";
+    pub const SUPPRESS_LOGMSGS: &[u8] = b"suppress-logmsgs";
     pub const USE_MP: &[u8] = b"use-mp";
 }
 
@@ -31,6 +33,17 @@ fn handle_dbres<T>(x: Result<T, sled::Error>) -> Option<T> {
         error!("{}", e);
     })
     .ok()
+}
+
+fn handle_yn(t: &sled::Tree, key: &[u8], rest: &str) {
+    handle_dbres(match rest {
+        "Y" | "YES" | "Yes" | "y" | "yes" => t.insert(key, &[]),
+        "N" | "NO" | "No" | "n" | "no" => t.remove(key),
+        _ => {
+            error!("unknown specifier");
+            return;
+        }
+    });
 }
 
 fn foreach_hashes_tree<F>(dbt: &sled::Db, mut f: F) -> Result<(), sled::Error>
@@ -98,18 +111,23 @@ fn main() {
                     indoc!(
                         "
                         Commands:
-                        exit | quit      exit this program without saving
-                        clear            clear the hash² db table
-                        dprint           print the hash² db table
-                        flush            sync db data to disk
+                        exit | quit       exit this program without saving
+                        clear             clear the hash² db table
+                        dprint            print the hash² db table
+                        flush             sync db data to disk
+
+                        suppress-logmsgs y|n
+                                          enable/disable printing log messages to stdout/stderr
+                        set-logfile [FILE]
+                                          set logfile (or unset it)
 
                         set-max-filesize SIZ|none
-                                         skip any file with a length greater than SIZ
-                        use-mp y|n       enable/disable parallel hook runs
-                        set-hook FILE    set used hook (USAGE: ./hook.sh PATH)
-                        run FILE         process files from index, read file paths from FILE
-                                         (advice: use absolute paths)
-                                         This processing is interruptable with Ctrl+C.
+                                          skip any file with a length greater than SIZ
+                        use-mp y|n        enable/disable parallel hook runs
+                        set-hook FILE     set used hook (USAGE: ./hook.sh PATH)
+                        run FILE          process files from index, read file paths from FILE
+                                          (advice: use absolute paths)
+                                          This processing is interruptable with Ctrl+C.
 
                         If you want to set the database path, you must specify it
                             as the first command line argument to zs-filecrawler.
@@ -138,6 +156,12 @@ fn main() {
             "flush" => {
                 handle_dbres(dbt.flush());
             }
+            "set-logfile" => {
+                handle_dbres(dbt.remove(dbkeys::LOGFILE));
+            }
+            "set-max-filesize" => {
+                handle_dbres(dbt.remove(dbkeys::MAX_FSIZ));
+            }
             _ => {
                 let (cmd, rest) = match line.find(char::is_whitespace) {
                     Some(pos) => (&line[..pos], line[pos + 1..].trim()),
@@ -148,18 +172,13 @@ fn main() {
                     continue;
                 }
                 match cmd {
-                    "use-mp" => {
-                        handle_dbres(match rest {
-                            "Y" | "y" | "yes" => dbt.insert(dbkeys::USE_MP, &[]),
-                            "N" | "n" | "no" => dbt.remove(dbkeys::USE_MP),
-                            _ => {
-                                error!("unknown specifier");
-                                continue;
-                            }
-                        });
-                    }
+                    "use-mp" => handle_yn(&dbt, dbkeys::USE_MP, rest),
+                    "suppress-logmsgs" => handle_yn(&dbt, dbkeys::SUPPRESS_LOGMSGS, rest),
                     "set-hook" => {
                         handle_dbres(dbt.insert(dbkeys::HOOK, rest));
+                    }
+                    "set-logfile" => {
+                        handle_dbres(dbt.insert(dbkeys::LOGFILE, rest));
                     }
                     "set-max-filesize" => {
                         if rest == "none" {

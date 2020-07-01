@@ -8,6 +8,7 @@ use std::{convert::TryInto, io::Write, mem::drop, path::Path, time::Duration};
 struct DoneQueueItem<'a> {
     file: &'a Path,
     msg: Vec<u8>,
+    is_hookmsg: bool,
 }
 
 fn worker<'a>(
@@ -37,6 +38,7 @@ fn worker<'a>(
                             .send(DoneQueueItem {
                                 file: f,
                                 msg: format!("unable to open input file: {}", x).into_bytes(),
+                                is_hookmsg: false,
                             })
                             .is_err()
                         {
@@ -84,7 +86,14 @@ fn worker<'a>(
                 } else {
                     pb.set_message(&format!("hash {} file {}: skipped", h3, f.display()));
                 }
-                if idnq.send(DoneQueueItem { file: f, msg }).is_err() {
+                if idnq
+                    .send(DoneQueueItem {
+                        file: f,
+                        msg,
+                        is_hookmsg: true,
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -161,7 +170,7 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
     let hook = hook.as_path();
 
     let mut hasher = sha2::Sha256::new();
-    hasher.update(&*read_from_file(hook).expect("unable to read hook file"));
+    hasher.update(&*read_from_file(hook)?);
     let hook_hash = sled::IVec::from(&*hasher.finalize_reset());
     let hook_hash = &hook_hash;
 
@@ -170,8 +179,23 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
         .chain(hook_hash.iter())
         .map(|i| *i)
         .collect();
-    let thashes = db.open_tree(thashes).expect("unable to open hashes tree");
+    let thashes = db.open_tree(thashes)?;
     let thashes = &thashes;
+
+    let dont_suppress = db.get(dbkeys::SUPPRESS_LOGMSGS)?.is_none();
+    let mut logfile = match db.get(dbkeys::LOGFILE)? {
+        None => None,
+        Some(x) => {
+            let x = std::str::from_utf8(&x[..]).expect("non utf-8 log file name");
+            Some(
+                std::fs::OpenOptions::new()
+                    .read(false)
+                    .append(true)
+                    .create(true)
+                    .open(x)?,
+            )
+        }
+    };
 
     let (iwq, workqueue) = chan::bounded(4096 * wcnt);
     let (idnq, dnq) = chan::bounded::<DoneQueueItem>(1024 * wcnt);
@@ -195,17 +219,41 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
                         break;
                     }
                     if !x.msg.is_empty() {
+                        let premsg = logfile.as_ref().map(|_| {
+                            format!(
+                                "[{}] {}: ",
+                                if x.is_hookmsg { "HOOK" } else { "INGEST" },
+                                x.file.display()
+                            )
+                        });
                         if let Ok(y) = std::str::from_utf8(&x.msg[..]) {
-                            for i in y.trim().lines() {
-                                fpb.println(format!("{}: {}", x.file.display(), i.trim()));
+                            let y = y.trim();
+                            if dont_suppress {
+                                for i in y.lines() {
+                                    fpb.println(format!("{}: {}", x.file.display(), i.trim()));
+                                }
+                            }
+                            if let Some(log) = logfile.as_mut() {
+                                let premsg = premsg.unwrap();
+                                for i in y.lines() {
+                                    writeln!(log, "{}{}", premsg, i.trim()).unwrap();
+                                }
                             }
                         } else {
-                            stderr
-                                .write_all(format!("{}: ", x.file.display()).as_bytes())
-                                .unwrap();
-                            stderr.write_all(&x.msg[..]).unwrap();
-                            stderr.write_all(b"\n").unwrap();
-                            stderr.flush().unwrap();
+                            if dont_suppress {
+                                stderr
+                                    .write_all(format!("{}: ", x.file.display()).as_bytes())
+                                    .unwrap();
+                                stderr.write_all(&x.msg[..]).unwrap();
+                                stderr.write_all(b"\n").unwrap();
+                                stderr.flush().unwrap();
+                            }
+                            if let Some(log) = logfile.as_mut() {
+                                log.write_all(premsg.unwrap().as_bytes()).unwrap();
+                                log.write_all(&x.msg[..]).unwrap();
+                                log.write_all(b"\n").unwrap();
+                                log.flush().unwrap();
+                            }
                         }
                     }
                     fpb.inc(1);
@@ -246,6 +294,7 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
                         idnq.send(DoneQueueItem {
                             file: rilp,
                             msg: Vec::new(),
+                            is_hookmsg: false,
                         })
                         .unwrap();
                         continue;
@@ -256,6 +305,7 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
                             idnq.send(DoneQueueItem {
                                 file: rilp,
                                 msg: format!("unable to read file metadata: {}", x).into_bytes(),
+                                is_hookmsg: false,
                             })
                             .unwrap();
                             continue;
@@ -265,6 +315,7 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
                         idnq.send(DoneQueueItem {
                             file: rilp,
                             msg: "file is too big".to_string().into_bytes(),
+                            is_hookmsg: false,
                         })
                         .unwrap();
                         continue;
