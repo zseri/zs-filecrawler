@@ -197,12 +197,12 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
                         idnq.send(false).unwrap();
                         continue;
                     }
-                    ips.set_message(&format!("{}", ril));
+                    ips.set_message(ril);
                     if iwq.send(Path::new(ril).to_path_buf()).is_err() {
                         break;
                     }
                 }
-                ips.finish_and_clear();
+                ips.finish();
                 ipb.abandon();
             });
         }
@@ -252,6 +252,9 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
                                     continue;
                                 }
                             };
+                            if fh2.len() > 40_960 {
+                                pb.set_message(&format!("file {}: calculate hash", f.display()));
+                            }
                             hasher.update(fh2.as_slice());
                             let h = hasher.finalize_reset();
                             drop(fh2);
