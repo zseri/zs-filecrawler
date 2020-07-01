@@ -6,7 +6,7 @@ use indoc::indoc;
 use log::error;
 use std::{
     convert::TryInto,
-    io::{BufRead, Write},
+    io::Write,
     mem::drop,
     path::{Path, PathBuf},
     sync::Arc,
@@ -88,6 +88,13 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
             return Ok(());
         }
     };
+    let fh = match std::str::from_utf8(&*fh) {
+        Ok(x) => x,
+        Err(x) => {
+            error!("Unable to parse input file {}: {}", ingestf.display(), x);
+            return Ok(());
+        }
+    };
 
     let wcnt: usize = 1 + if db.get(dbkeys::USE_MP)?.is_some() {
         num_cpus::get()
@@ -95,7 +102,7 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
         0
     };
 
-    let hook = Arc::new(match db.get(dbkeys::HOOK)? {
+    let hook = match db.get(dbkeys::HOOK)? {
         Some(h) => {
             let p = match std::str::from_utf8(&*h) {
                 Ok(x) => Path::new(x),
@@ -114,20 +121,27 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
             error!("No hook set!");
             return Ok(());
         }
-    });
+    };
+    let hook = hook.as_path();
+
+    let thashes = db
+        .open_tree(dbtrees::HASHES)
+        .expect("unable to open hashes tree");
+    let thashes = &thashes;
 
     let mut hasher = sha2::Sha256::new();
-    hasher.update(&*read_from_file(hook.as_path()).expect("unable to read hook file"));
+    hasher.update(&*read_from_file(hook).expect("unable to read hook file"));
     let hook_hash = sled::IVec::from(&*hasher.finalize_reset());
+    let hook_hash = &hook_hash;
 
     let (iwq, workqueue) = chan::bounded(100 * wcnt);
     let (idnq, dnq) = chan::bounded(1000 * wcnt);
-    let sigdat = Arc::new(sigdat.disarm_aquire());
+    let sigdat = sigdat.disarm_aquire();
+    let sigdat = &sigdat;
     let mpbs = indicatif::MultiProgress::new();
 
     crossbeam_utils::thread::scope(move |s| {
         {
-            let sigdat = sigdat.clone();
             let fpb = ProgressBar::new(fh.lines().count().try_into().unwrap());
             fpb.set_style(
                 indicatif::ProgressStyle::default_bar()
@@ -154,7 +168,6 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
         }
 
         {
-            let sigdat = sigdat.clone();
             let idnq = idnq.clone();
 
             let ipb = ProgressBar::new(fh.lines().count().try_into().unwrap());
@@ -174,31 +187,23 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
             let ips = mpbs.add(ips);
 
             s.spawn(move |_| {
-                for ingline in ipb.wrap_iter(fh.lines()) {
+                for ril in ipb.wrap_iter(fh.lines()) {
                     if sigdat.got_ctrlc() {
                         break;
                     }
-                    if let Err(x) = &ingline {
-                        ips.println(format!("Got invalid line: ERROR: {}", x));
-                        idnq.send(false).unwrap();
-                        continue;
-                    }
-                    let ril = ingline.unwrap();
                     let ril = ril.trim_start();
-                    if ril.is_empty()
-                        || ril.bytes().next().unwrap() == b'#'
-                        || !Path::new(ril).is_file()
-                    {
+                    let rilp = Path::new(ril);
+                    if ril.is_empty() || ril.bytes().next().unwrap() == b'#' || !rilp.is_file() {
                         idnq.send(false).unwrap();
                         continue;
                     }
-                    if does_exceed_max_filesize(Path::new(ril), max_filesize) {
+                    if does_exceed_max_filesize(rilp, max_filesize) {
                         ips.println(format!("File is too big: {}", ril));
                         idnq.send(false).unwrap();
                         continue;
                     }
                     ips.set_message(ril);
-                    if iwq.send(Path::new(ril).to_path_buf()).is_err() {
+                    if iwq.send(rilp).is_err() {
                         break;
                     }
                 }
@@ -207,24 +212,16 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
             });
         }
 
-        let thashes = db
-            .open_tree(dbtrees::HASHES)
-            .expect("unable to open hashes tree");
-
         let pbstyle = indicatif::ProgressStyle::default_spinner()
             .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
             .template("{spinner} {wide_msg}");
 
         for _ in 0..wcnt {
-            let sigdat = sigdat.clone();
             let pb = indicatif::ProgressBar::new(0);
             pb.set_style(pbstyle.clone());
             let pb = mpbs.add(pb);
             let workqueue = workqueue.clone();
             let idnq = idnq.clone();
-            let thashes = thashes.clone();
-            let hook = hook.clone();
-            let hook_hash = hook_hash.clone();
             let mut hasher = sha2::Sha256::new();
             s.spawn(move |_| {
                 loop {
@@ -265,19 +262,19 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
                                 .get(&*h)
                                 .expect("unable to retrieve hash data")
                                 .as_ref()
-                                != Some(&hook_hash)
+                                != Some(hook_hash)
                             {
                                 use std::process as prc;
                                 pb.set_message(&format!("hash {} file {}: run", h3, f.display()));
 
-                                match prc::Command::new(hook.as_path())
+                                match prc::Command::new(hook)
                                     .arg(&f)
                                     .stdin(prc::Stdio::null())
                                     .output()
                                 {
                                     Ok(mut x) if x.status.success() => {
                                         thashes
-                                            .insert(&*h, hook_hash.clone())
+                                            .insert(&*h, hook_hash)
                                             .expect("unable to update hash data");
                                         x.stderr.extend_from_slice(&x.stdout[..]);
                                         if let Ok(x) = std::str::from_utf8(&x.stderr) {
