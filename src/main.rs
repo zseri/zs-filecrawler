@@ -5,6 +5,7 @@ use digest::Digest;
 use indoc::indoc;
 use log::error;
 use std::{
+    convert::TryInto,
     io::{BufRead, Write},
     mem::drop,
     path::{Path, PathBuf},
@@ -80,19 +81,18 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
         return Ok(());
     }
 
-    let fh = read_from_file(ingestf);
-    if let Err(x) = &fh {
-        error!("Unable to open input file ({}: {})", ingestf.display(), x);
-        return Ok(());
-    }
-
-    let wcnt: usize = if db.get(dbkeys::USE_MP)?.is_some() {
-        match num_cpus::get() {
-            0 => 1,
-            x => x,
+    let fh = match read_from_file(ingestf) {
+        Ok(x) => x,
+        Err(x) => {
+            error!("Unable to open input file {}: {}", ingestf.display(), x);
+            return Ok(());
         }
+    };
+
+    let wcnt: usize = 1 + if db.get(dbkeys::USE_MP)?.is_some() {
+        num_cpus::get()
     } else {
-        1
+        0
     };
 
     let hook = Arc::new(match db.get(dbkeys::HOOK)? {
@@ -120,29 +120,67 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
     hasher.update(&*read_from_file(hook.as_path()).expect("unable to read hook file"));
     let hook_hash = sled::IVec::from(&*hasher.finalize_reset());
 
-    let (iwq, workqueue) = chan::bounded(2 * wcnt + 1);
+    let (iwq, workqueue) = chan::bounded(100 * wcnt);
+    let (idnq, dnq) = chan::bounded(1000 * wcnt);
     let sigdat = Arc::new(sigdat.disarm_aquire());
     let mpbs = indicatif::MultiProgress::new();
-
-    let pbstyle = indicatif::ProgressStyle::default_spinner()
-        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
-        .template("[{elapsed_precise}] {prefix:.bold.dim} {spinner} {wide_msg}");
-    let ipb = ProgressBar::new_spinner();
-    ipb.set_style(pbstyle);
-    let ipb = mpbs.add(ipb);
 
     crossbeam_utils::thread::scope(move |s| {
         {
             let sigdat = sigdat.clone();
+            let fpb = ProgressBar::new(fh.lines().count().try_into().unwrap());
+            fpb.set_style(
+                indicatif::ProgressStyle::default_bar()
+                    .template("{prefix:.bold.dim} {wide_bar} {pos}/{len}"),
+            );
+            fpb.set_prefix(" done ");
+            let fpb = mpbs.add(fpb);
             s.spawn(move |_| {
-                let mut cnt_plus: usize = 0;
+                while let Ok(x) = dnq.recv() {
+                    if sigdat.got_ctrlc() {
+                        break;
+                    }
+                    if x {
+                        fpb.inc(1);
+                    } else {
+                        fpb.set_length(fpb.length() - 1);
+                    }
+                    if fpb.is_finished() {
+                        break;
+                    }
+                }
+                fpb.abandon();
+            });
+        }
 
-                for ingline in fh.unwrap().as_slice().lines() {
+        {
+            let sigdat = sigdat.clone();
+            let idnq = idnq.clone();
+
+            let ipb = ProgressBar::new(fh.lines().count().try_into().unwrap());
+            ipb.set_style(
+                indicatif::ProgressStyle::default_bar()
+                    .template("{prefix:.bold.dim} {wide_bar} {pos}/{len}"),
+            );
+            ipb.set_prefix("ingest");
+            let ipb = mpbs.add(ipb);
+            let ips = ProgressBar::new_spinner();
+            ips.set_style(
+                indicatif::ProgressStyle::default_spinner()
+                    .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+                    .template("[{elapsed_precise}] {prefix:.bold.dim} {spinner} {wide_msg}"),
+            );
+            ips.set_prefix("ingest");
+            let ips = mpbs.add(ips);
+
+            s.spawn(move |_| {
+                for ingline in ipb.wrap_iter(fh.lines()) {
                     if sigdat.got_ctrlc() {
                         break;
                     }
                     if let Err(x) = &ingline {
-                        ipb.println(format!("Got invalid line: ERROR: {}", x));
+                        ips.println(format!("Got invalid line: ERROR: {}", x));
+                        idnq.send(false).unwrap();
                         continue;
                     }
                     let ril = ingline.unwrap();
@@ -151,48 +189,43 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
                         || ril.bytes().next().unwrap() == b'#'
                         || !Path::new(ril).is_file()
                     {
+                        idnq.send(false).unwrap();
                         continue;
                     }
                     if does_exceed_max_filesize(Path::new(ril), max_filesize) {
-                        ipb.println(format!("File is too big: {}", ril));
+                        ips.println(format!("File is too big: {}", ril));
+                        idnq.send(false).unwrap();
                         continue;
                     }
-                    let fh2 = read_from_file(ril);
-                    if let Err(x) = &fh2 {
-                        ipb.println(format!("Unable to open input file ({}: {})", ril, x));
-                        continue;
+                    ips.set_message(&format!("{}", ril));
+                    if iwq.send(Path::new(ril).to_path_buf()).is_err() {
+                        break;
                     }
-                    hasher.update(fh2.unwrap().as_slice());
-                    let hash = hasher.finalize_reset();
-                    cnt_plus += 1;
-                    ipb.set_message(&format!(
-                        "ingest {}: {} with hash {}",
-                        cnt_plus,
-                        ril,
-                        hex::encode(&hash)
-                    ));
-                    iwq.send((Path::new(ril).to_path_buf(), hash)).unwrap();
                 }
-                ipb.finish_and_clear();
+                ips.finish_and_clear();
+                ipb.abandon();
             });
         }
 
-        let pbstyle = indicatif::ProgressStyle::default_spinner()
-            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
-            .template("{prefix:.bold.dim} {spinner} {len} {wide_msg}");
         let thashes = db
             .open_tree(dbtrees::HASHES)
             .expect("unable to open hashes tree");
 
+        let pbstyle = indicatif::ProgressStyle::default_spinner()
+            .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ ")
+            .template("{spinner} {wide_msg}");
+
         for _ in 0..wcnt {
+            let sigdat = sigdat.clone();
             let pb = indicatif::ProgressBar::new(0);
             pb.set_style(pbstyle.clone());
             let pb = mpbs.add(pb);
             let workqueue = workqueue.clone();
+            let idnq = idnq.clone();
             let thashes = thashes.clone();
             let hook = hook.clone();
             let hook_hash = hook_hash.clone();
-            let sigdat = sigdat.clone();
+            let mut hasher = sha2::Sha256::new();
             s.spawn(move |_| {
                 loop {
                     if sigdat.got_ctrlc() {
@@ -204,8 +237,25 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
                         Err(chan::RecvTimeoutError::Timeout) => continue,
                         Err(chan::RecvTimeoutError::Disconnected) => break,
 
-                        Ok((f, h)) => {
-                            pb.inc_length(1);
+                        Ok(f) => {
+                            let fh2 = match read_from_file(&f) {
+                                Ok(x) => x,
+                                Err(x) => {
+                                    pb.println(format!(
+                                        "Unable to open input file {}: {}",
+                                        f.display(),
+                                        x
+                                    ));
+                                    if idnq.send(false).is_err() {
+                                        break;
+                                    }
+                                    continue;
+                                }
+                            };
+                            hasher.update(fh2.as_slice());
+                            let h = hasher.finalize_reset();
+                            drop(fh2);
+
                             let h3 = hex::encode(&*h);
 
                             if thashes
@@ -251,7 +301,9 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
                                     f.display()
                                 ));
                             }
-                            pb.inc(1);
+                            if idnq.send(true).is_err() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -259,6 +311,7 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
             });
         }
         drop(workqueue);
+        drop(idnq);
         mpbs.join().unwrap();
     })
     .map_err(|_| {
@@ -286,7 +339,14 @@ fn main() {
         dbpath = dbf.into()
     }
 
-    let dbt = sled::open(dbpath).expect("unable to open database");
+    let dbt = sled::Config::new()
+        .path(dbpath)
+        .mode(sled::Mode::HighThroughput)
+        .cache_capacity(1_048_576)
+        .use_compression(true)
+        .compression_factor(5)
+        .open()
+        .expect("unable to open database");
 
     let thashes = dbt
         .open_tree(dbtrees::HASHES)
