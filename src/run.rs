@@ -290,7 +290,7 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
                     }
                     let ril = ril.trim_start();
                     let rilp = Path::new(ril);
-                    if ril.is_empty() || ril.bytes().next().unwrap() == b'#' || !rilp.is_file() {
+                    if ril.is_empty() || ril.bytes().next().unwrap() == b'#' {
                         idnq.send(DoneQueueItem {
                             file: rilp,
                             msg: Vec::new(),
@@ -311,6 +311,15 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
                             continue;
                         }
                     };
+                    if !meta.is_file() {
+                        idnq.send(DoneQueueItem {
+                            file: rilp,
+                            msg: Vec::new(),
+                            is_hookmsg: false,
+                        })
+                        .unwrap();
+                        continue;
+                    }
                     if does_exceed_max_filesize(&meta, max_filesize) {
                         idnq.send(DoneQueueItem {
                             file: rilp,

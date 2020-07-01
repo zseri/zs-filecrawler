@@ -111,7 +111,7 @@ fn main() {
                     indoc!(
                         "
                         Commands:
-                        exit | quit       exit this program without saving
+                        exit | quit       exit this program
                         clear             clear the hash² db table
                         dprint            print the hash² db table
                         flush             sync db data to disk
