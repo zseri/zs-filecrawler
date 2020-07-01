@@ -24,23 +24,6 @@ mod dbtrees {
     pub const HASHES: &[u8] = b"hashes";
 }
 
-fn logger_init() {
-    use simplelog::*;
-    CombinedLogger::init(vec![TermLogger::new(
-        LevelFilter::Info,
-        Config::default(),
-        TerminalMode::Mixed,
-    )])
-    .unwrap();
-}
-
-fn split_command(line: &str) -> (&str, &str) {
-    match line.find(char::is_whitespace) {
-        Some(pos) => (&line[..pos], &line[pos + 1..]),
-        None => (line, ""),
-    }
-}
-
 fn read_from_file<P: AsRef<Path>>(path: P) -> std::io::Result<readfilez::FileHandle> {
     readfilez::read_from_file(std::fs::File::open(path))
 }
@@ -323,17 +306,24 @@ fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sled::E
 }
 
 fn main() {
-    logger_init();
+    {
+        use simplelog::*;
+        CombinedLogger::init(vec![TermLogger::new(
+            LevelFilter::Info,
+            Config::default(),
+            TerminalMode::Mixed,
+        )])
+        .unwrap();
+    }
 
     let sigdat = Arc::new(SignalDataIntern::new());
     register_signal_handlers(sigdat.clone());
 
-    let mut stdout = std::io::stdout();
     let mut dbpath = PathBuf::from("zsfc-progstate");
 
     if let Some(dbf) = std::env::args().nth(1) {
         if dbf == "--help" {
-            writeln!(stdout, "USAGE: zs-filecrawler [DB_PATH]").unwrap();
+            println!("USAGE: zs-filecrawler [DB_PATH]");
             std::process::exit(0);
         }
         dbpath = dbf.into()
@@ -355,8 +345,8 @@ fn main() {
     loop {
         // disable catching of Ctrl-C
         sigdat.set_ctrlc_armed(true);
-        write!(stdout, "zs-filecrawler >> ").unwrap();
-        stdout.flush().unwrap();
+        print!("zs-filecrawler >> ");
+        std::io::stdout().flush().unwrap();
 
         let line: String = read!("{}\n");
         let line = line.trim();
@@ -407,8 +397,10 @@ fn main() {
                 handle_dbres(dbt.flush());
             }
             _ => {
-                let (cmd, rest) = split_command(line);
-                let rest = rest.trim();
+                let (cmd, rest) = match line.find(char::is_whitespace) {
+                    Some(pos) => (&line[..pos], line[pos + 1..].trim()),
+                    None => (line, ""),
+                };
                 if rest.is_empty() {
                     error!("No input file given or unknown command!");
                     continue;
