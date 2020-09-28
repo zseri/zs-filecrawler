@@ -14,15 +14,18 @@ crossbeam-utils = "0.7"
 digest = "0.9"
 hex = "0.4"
 indicatif = "0.15"
-indoc = "0.3"
+indoc = "1.0"
 log = "0.4"
 num_cpus = "1.13"
 readfilez = "0.2"
 sha2 = "0.9"
 signal-hook = "0.1"
 simplelog = "0.8"
-sled = { version = "0.32", features = ["compression"] }
+sled = { version = "0.34", features = ["compression"] }
 text_io = "0.1"
+
+[features]
+io_uring = ["sled/io_uring"]
 
 [profile.release]
 lto = true

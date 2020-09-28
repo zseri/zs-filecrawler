@@ -61,11 +61,11 @@ fn worker<'a>(
                 }
 
                 hasher.update(fh2.as_slice());
-                let h = {
-                    let mut tmp = [0u8; 32];
-                    tmp.copy_from_slice(&*hasher.finalize_reset());
-                    tmp
-                };
+                let h: [u8; 32] = hasher
+                    .finalize_reset()
+                    .as_slice()
+                    .try_into()
+                    .expect("hash algo has unexpected hash result size");
                 drop(fh2);
 
                 let h3 = hex::encode(&h);
