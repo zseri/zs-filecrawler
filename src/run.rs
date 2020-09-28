@@ -11,12 +11,20 @@ struct DoneQueueItem<'a> {
     is_hookmsg: bool,
 }
 
+struct HashQueueItem<'a> {
+    file: &'a Path,
+    hash: [u8; 32],
+    h3: String,
+}
+
 fn worker<'a>(
     sigdat: &SignalDataUnArmed,
     hook: &Path,
     thashes: &sled::Tree,
     pb: ProgressBar,
     workqueue: chan::Receiver<&'a Path>,
+    hsqs: chan::Sender<HashQueueItem<'a>>,
+    hsqr: chan::Receiver<HashQueueItem<'a>>,
     idnq: chan::Sender<DoneQueueItem<'a>>,
 ) {
     let mut hasher = sha2::Sha256::new();
@@ -26,11 +34,12 @@ fn worker<'a>(
             break;
         }
         pb.tick();
-        match workqueue.recv_timeout(Duration::from_secs(1)) {
-            Err(chan::RecvTimeoutError::Timeout) => continue,
-            Err(chan::RecvTimeoutError::Disconnected) => break,
-
-            Ok(f) => {
+        chan::select! {
+            recv(workqueue) -> msg => {
+                let f = match msg {
+                    Ok(msg) => msg,
+                    Err(_) => break,
+                };
                 let fh2 = match read_from_file(&f) {
                     Ok(x) => x,
                     Err(x) => {
@@ -52,43 +61,63 @@ fn worker<'a>(
                 }
 
                 hasher.update(fh2.as_slice());
-                let h = hasher.finalize_reset();
+                let h = {
+                    let mut tmp = [0u8; 32];
+                    tmp.copy_from_slice(&*hasher.finalize_reset());
+                    tmp
+                };
                 drop(fh2);
 
-                let h3 = hex::encode(&*h);
-                let mut msg = Vec::new();
+                let h3 = hex::encode(&h);
 
                 if thashes
-                    .get(&*h)
+                    .get(&h)
                     .expect("unable to retrieve hash data")
                     .as_ref()
                     .is_none()
                 {
-                    use std::process as prc;
-                    pb.set_message(&format!("hash {} file {}: run", h3, f.display()));
-
-                    match prc::Command::new(hook)
-                        .arg(&f)
-                        .stdin(prc::Stdio::null())
-                        .output()
-                    {
-                        Ok(mut x) if x.status.success() => {
-                            thashes
-                                .insert(&*h, &[])
-                                .expect("unable to update hash data");
-                            x.stderr.extend_from_slice(&x.stdout[..]);
-                            msg = x.stderr;
-                        }
-                        cmdres => {
-                            msg = format!("HOOK failed with {:?}", cmdres).into_bytes();
-                        }
-                    }
+                    hsqs.send(HashQueueItem {
+                        file: f,
+                        hash: h,
+                        h3,
+                    }).unwrap();
                 } else {
                     pb.set_message(&format!("hash {} file {}: skipped", h3, f.display()));
+                    if idnq
+                        .send(DoneQueueItem {
+                            file: f,
+                            msg: Vec::new(),
+                            is_hookmsg: true,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
+            }
+
+            recv(hsqr) -> msg => {
+                let HashQueueItem { file, hash, h3 } = msg.unwrap();
+                use std::process as prc;
+                pb.set_message(&format!("hash {} file {}: run", h3, file.display()));
+
+                let msg: Vec<_> = match prc::Command::new(hook)
+                    .arg(&file)
+                    .stdin(prc::Stdio::null())
+                    .output()
+                {
+                    Ok(mut x) if x.status.success() => {
+                        thashes
+                            .insert(&hash, &[])
+                            .expect("unable to update hash data");
+                        x.stderr.extend_from_slice(&x.stdout[..]);
+                        x.stderr
+                    }
+                    cmdres => format!("HOOK failed with {:?}", cmdres).into_bytes(),
+                };
                 if idnq
                     .send(DoneQueueItem {
-                        file: f,
+                        file,
                         msg,
                         is_hookmsg: true,
                     })
@@ -97,6 +126,8 @@ fn worker<'a>(
                     break;
                 }
             }
+
+            default(Duration::from_secs(1)) => continue,
         }
     }
     pb.finish();
@@ -198,6 +229,7 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
     };
 
     let (iwq, workqueue) = chan::bounded(4096 * wcnt);
+    let (hsqs, hsqr) = chan::bounded::<HashQueueItem>(4096 * wcnt);
     let (idnq, dnq) = chan::bounded::<DoneQueueItem>(1024 * wcnt);
     let sigdat = sigdat.disarm_aquire();
     let sigdat = &sigdat;
@@ -348,8 +380,10 @@ pub fn run(db: &sled::Db, sigdat: &SignalData, ingestf: &Path) -> Result<(), sle
             pb.set_style(pbstyle.clone());
             let pb = mpbs.add(pb);
             let workqueue = workqueue.clone();
+            let hsqs = hsqs.clone();
+            let hsqr = hsqr.clone();
             let idnq = idnq.clone();
-            s.spawn(move |_| worker(sigdat, hook, thashes, pb, workqueue, idnq));
+            s.spawn(move |_| worker(sigdat, hook, thashes, pb, workqueue, hsqs, hsqr, idnq));
         }
         drop(workqueue);
         drop(idnq);
