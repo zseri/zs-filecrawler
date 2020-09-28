@@ -668,6 +668,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-utils",
  "digest",
+ "glob",
  "hex",
  "indicatif",
  "indoc",

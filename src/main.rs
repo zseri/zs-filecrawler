@@ -128,6 +128,7 @@ fn main() {
                         run FILE          process files from index, read file paths from FILE
                                           (advice: use absolute paths)
                                           This processing is interruptable with Ctrl+C.
+                        run-glob GLOB     process files, gather file paths via GLOB pattern
 
                         If you want to set the database path, you must specify it
                             as the first command line argument to zs-filecrawler.
@@ -201,7 +202,18 @@ fn main() {
                         );
                     }
                     "run" => {
-                        handle_dbres(crate::run::run(&dbt, &sigdat, Path::new(rest)));
+                        handle_dbres(crate::run::run(
+                            &dbt,
+                            &sigdat,
+                            crate::run::IngestList::IndexFile(Path::new(rest)),
+                        ));
+                    }
+                    "run-glob" => {
+                        handle_dbres(crate::run::run(
+                            &dbt,
+                            &sigdat,
+                            crate::run::IngestList::GlobPattern(rest),
+                        ));
                     }
                     _ => {
                         error!("Unknown command!");
