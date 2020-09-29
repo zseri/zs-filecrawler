@@ -1,10 +1,10 @@
-use crate::{dbkeys, dbtrees, read_from_file, signals::*};
+use crate::{misc::*, signals::*};
 use crossbeam_channel as chan;
 use digest::Digest;
 use indicatif::ProgressBar;
 use log::error;
-use std::{convert::TryInto, io::Write, mem::drop, time::Duration};
 use std::path::{Path, PathBuf};
+use std::{convert::TryInto, io::Write, mem::drop, time::Duration};
 
 struct DoneQueueItem<F> {
     file: F,
@@ -32,8 +32,7 @@ fn worker<FilPath>(
     hsqs: chan::Sender<HashQueueItem<FilPath>>,
     hsqr: chan::Receiver<HashQueueItem<FilPath>>,
     idnq: chan::Sender<DoneQueueItem<FilPath>>,
-)
-where
+) where
     FilPath: std::convert::AsRef<Path>,
 {
     let mut hasher = sha2::Sha256::new();
@@ -448,15 +447,41 @@ fn run_globpat(
     mut logfile: Option<std::fs::File>,
     glob_pattern: &str,
 ) -> Result<(), sled::Error> {
-    let paths = match glob::glob(glob_pattern) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("ERROR: the given glob pattern is invalid: {}", e);
-            return Ok(());
-        },
+    let paths = {
+        let mut it = crate::misc::ShellwordSplitter::new(glob_pattern);
+
+        let base = match it.next() {
+            Some(Ok(x)) => x,
+            _ => {
+                eprintln!(
+                    "ERROR: failed to parse 'run-glob' arguments, invalid invocation (base path)"
+                );
+                return Ok(());
+            }
+        };
+        let base = std::path::Path::new(&*base);
+
+        let patterns = match it.collect::<Result<Vec<_>, _>>() {
+            Ok(x) => x,
+            Err(_) => {
+                eprintln!("ERROR: failed to parse 'run-glob' arguments, invalid invocation (pattern list)");
+                return Ok(());
+            }
+        };
+
+        match globwalk::GlobWalkerBuilder::from_patterns(base, &patterns[..])
+            .file_type(globwalk::FileType::FILE)
+            .build()
+        {
+            Ok(x) => x,
+            Err(_) => {
+                eprintln!("ERROR: failed to prepare the GlobWalker");
+                return Ok(());
+            }
+        }
     };
 
-    let (iwq, workqueue) = chan::bounded(4096 * wcnt);
+    let (iwq, workqueue) = chan::bounded(1024 * wcnt);
     let (hsqs, hsqr) = chan::bounded::<HashQueueItem<PathBuf>>(4096 * wcnt);
     let (idnq, dnq) = chan::bounded::<DoneQueueItem<PathBuf>>(1024 * wcnt);
     let sigdat = sigdat.disarm_aquire();
@@ -466,9 +491,10 @@ fn run_globpat(
     crossbeam_utils::thread::scope(move |s| {
         {
             let fps = ProgressBar::new_spinner();
-            fps.set_style(indicatif::ProgressStyle::default_spinner().template(
-                "{prefix:.bold.dim} [{elapsed_precise}] {spinner} {wide_msg}",
-            ));
+            fps.set_style(
+                indicatif::ProgressStyle::default_spinner()
+                    .template("{prefix:.bold.dim} [{elapsed_precise}] {spinner} {wide_msg}"),
+            );
             fps.set_prefix(" done ");
             let fps = mpbs.add(fps);
 
@@ -546,19 +572,22 @@ fn run_globpat(
                         Ok(p) => p,
                         Err(e) => {
                             idnq.send(DoneQueueItem {
-                                file: e.path().to_path_buf(),
-                                msg: format!("glob iter error: {}", e.error()).into_bytes(),
+                                file: e
+                                    .path()
+                                    .map(Path::to_path_buf)
+                                    .unwrap_or(PathBuf::from("/")),
+                                msg: format!("glob iter error: {}", e).into_bytes(),
                                 is_hookmsg: false,
                             })
                             .unwrap();
                             continue;
-                        },
+                        }
                     };
-                    let meta = match std::fs::metadata(&rilp) {
+                    let meta = match rilp.metadata() {
                         Ok(x) => x,
                         Err(x) => {
                             idnq.send(DoneQueueItem {
-                                file: rilp,
+                                file: rilp.into_path(),
                                 msg: format!("unable to read file metadata: {}", x).into_bytes(),
                                 is_hookmsg: false,
                             })
@@ -568,7 +597,7 @@ fn run_globpat(
                     };
                     if !meta.is_file() {
                         idnq.send(DoneQueueItem {
-                            file: rilp,
+                            file: rilp.into_path(),
                             msg: Vec::new(),
                             is_hookmsg: false,
                         })
@@ -577,15 +606,15 @@ fn run_globpat(
                     }
                     if does_exceed_max_filesize(&meta, max_filesize) {
                         idnq.send(DoneQueueItem {
-                            file: rilp,
+                            file: rilp.into_path(),
                             msg: "file is too big".to_string().into_bytes(),
                             is_hookmsg: false,
                         })
                         .unwrap();
                         continue;
                     }
-                    ips.set_message(&format!("{}", rilp.display()));
-                    if iwq.send(rilp).is_err() {
+                    ips.set_message(&format!("{}", rilp.path().display()));
+                    if iwq.send(rilp.into_path()).is_err() {
                         break;
                     }
                 }

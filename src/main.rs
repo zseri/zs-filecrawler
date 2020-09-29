@@ -1,7 +1,8 @@
+mod misc;
 mod run;
 mod signals;
 
-use crate::signals::*;
+use crate::{misc::*, signals::*};
 use indoc::indoc;
 use log::error;
 use std::{
@@ -10,53 +11,6 @@ use std::{
     sync::Arc,
 };
 use text_io::read;
-
-mod dbkeys {
-    pub const HOOK: &[u8] = b"hook";
-    pub const LOGFILE: &[u8] = b"logfile";
-    pub const MAX_FSIZ: &[u8] = b"max-filesize";
-    pub const SUPPRESS_LOGMSGS: &[u8] = b"suppress-logmsgs";
-    pub const USE_MP: &[u8] = b"use-mp";
-}
-
-mod dbtrees {
-    pub const HASHES_: &[u8] = b"hashes:";
-}
-
-#[inline]
-fn read_from_file<P: AsRef<Path>>(path: P) -> std::io::Result<readfilez::FileHandle> {
-    readfilez::read_from_file(std::fs::File::open(path))
-}
-
-fn handle_dbres<T>(x: Result<T, sled::Error>) -> Option<T> {
-    x.map_err(|e| {
-        error!("{}", e);
-    })
-    .ok()
-}
-
-fn handle_yn(t: &sled::Tree, key: &[u8], rest: &str) {
-    handle_dbres(match rest {
-        "Y" | "YES" | "Yes" | "y" | "yes" => t.insert(key, &[]),
-        "N" | "NO" | "No" | "n" | "no" => t.remove(key),
-        _ => {
-            error!("unknown specifier");
-            return;
-        }
-    });
-}
-
-fn foreach_hashes_tree<F>(dbt: &sled::Db, mut f: F) -> Result<(), sled::Error>
-where
-    F: FnMut(&[u8], sled::Tree) -> Result<(), sled::Error>,
-{
-    for x in dbt.tree_names() {
-        if x.starts_with(dbtrees::HASHES_) {
-            f(&x[dbtrees::HASHES_.len()..], dbt.open_tree(&x)?)?;
-        }
-    }
-    Ok(())
-}
 
 fn main() {
     {
