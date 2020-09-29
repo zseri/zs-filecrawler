@@ -12,12 +12,6 @@ struct DoneQueueItem<F> {
     is_hookmsg: bool,
 }
 
-struct HashQueueItem<F> {
-    file: F,
-    hash: [u8; 32],
-    h3: String,
-}
-
 pub enum IngestList<'a> {
     IndexFile(&'a Path),
     GlobPattern(&'a str),
@@ -29,8 +23,6 @@ fn worker<FilPath>(
     thashes: &sled::Tree,
     pb: ProgressBar,
     workqueue: chan::Receiver<FilPath>,
-    hsqs: chan::Sender<HashQueueItem<FilPath>>,
-    hsqr: chan::Receiver<HashQueueItem<FilPath>>,
     idnq: chan::Sender<DoneQueueItem<FilPath>>,
 ) where
     FilPath: std::convert::AsRef<Path>,
@@ -38,103 +30,75 @@ fn worker<FilPath>(
     let mut hasher = sha2::Sha256::new();
     while !sigdat.got_ctrlc() {
         pb.tick();
-        chan::select! {
-            recv(workqueue) -> msg => {
-                let f = match msg {
-                    Ok(msg) => msg,
-                    Err(_) => break,
-                };
-                let far = f.as_ref();
-                let fh2 = match read_from_file(far) {
-                    Ok(x) => x,
-                    Err(x) => {
-                        if idnq
-                            .send(DoneQueueItem {
-                                file: f,
-                                msg: format!("unable to open input file: {}", x).into_bytes(),
-                                is_hookmsg: false,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                        continue;
-                    }
-                };
-                let fdi = far.display();
-                if fh2.len() > 40_960 {
-                    pb.set_message(&format!("file {}: calculate hash", fdi));
-                }
 
-                hasher.update(fh2.as_slice());
-                let h: [u8; 32] = hasher
-                    .finalize_reset()
-                    .as_slice()
-                    .try_into()
-                    .expect("hash algo has unexpected hash result size");
-                drop(fh2);
+        let file = match workqueue.recv_timeout(Duration::from_secs(1)) {
+            Ok(x) => x,
+            Err(chan::RecvTimeoutError::Timeout) => continue,
+            Err(chan::RecvTimeoutError::Disconnected) => break,
+        };
 
-                let h3 = hex::encode(&h);
-
-                if thashes
-                    .get(&h)
-                    .expect("unable to retrieve hash data")
-                    .as_ref()
-                    .is_none()
-                {
-                    hsqs.send(HashQueueItem {
-                        file: f,
-                        hash: h,
-                        h3,
-                    }).unwrap();
-                } else {
-                    pb.set_message(&format!("hash {} file {}: skipped", h3, fdi));
-                    if idnq
-                        .send(DoneQueueItem {
-                            file: f,
-                            msg: Vec::new(),
-                            is_hookmsg: true,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-
-            recv(hsqr) -> msg => {
-                let HashQueueItem { file, hash, h3 } = msg.unwrap();
-                let far = file.as_ref();
-                use std::process as prc;
-                pb.set_message(&format!("hash {} file {}: run", h3, far.display()));
-
-                let msg: Vec<_> = match prc::Command::new(hook)
-                    .arg(far)
-                    .stdin(prc::Stdio::null())
-                    .output()
-                {
-                    Ok(mut x) if x.status.success() => {
-                        thashes
-                            .insert(&hash, &[])
-                            .expect("unable to update hash data");
-                        x.stderr.extend_from_slice(&x.stdout[..]);
-                        x.stderr
-                    }
-                    cmdres => format!("HOOK failed with {:?}", cmdres).into_bytes(),
-                };
+        let far = file.as_ref();
+        let fh2 = match read_from_file(far) {
+            Ok(x) => x,
+            Err(x) => {
                 if idnq
                     .send(DoneQueueItem {
                         file,
-                        msg,
-                        is_hookmsg: true,
+                        msg: format!("unable to open input file: {}", x).into_bytes(),
+                        is_hookmsg: false,
                     })
                     .is_err()
                 {
                     break;
                 }
+                continue;
             }
+        };
+        let fdi = far.display();
+        if fh2.len() > 40_960 {
+            pb.set_message(&format!("file {}: calculate hash", fdi));
+        }
 
-            default(Duration::from_secs(1)) => continue,
+        hasher.update(fh2.as_slice());
+        let h = hasher.finalize_reset();
+        drop(fh2);
+
+        let h3 = hex::encode(&h);
+
+        let msg = if thashes
+            .get(&h)
+            .expect("unable to retrieve hash data")
+            .as_ref()
+            .is_none()
+        {
+            pb.set_message(&format!("hash {} file {}: run", h3, far.display()));
+            use std::process as prc;
+
+            match prc::Command::new(hook)
+                .arg(far)
+                .stdin(prc::Stdio::null())
+                .output()
+            {
+                Ok(mut x) if x.status.success() => {
+                    thashes.insert(&h, &[]).expect("unable to update hash data");
+                    x.stderr.extend_from_slice(&x.stdout[..]);
+                    x.stderr
+                }
+                cmdres => format!("HOOK failed with {:?}", cmdres).into_bytes(),
+            }
+        } else {
+            pb.set_message(&format!("hash {} file {}: skipped", h3, fdi));
+            Vec::new()
+        };
+        if idnq
+            .send(DoneQueueItem {
+                file,
+                msg,
+                is_hookmsg: true,
+            })
+            .is_err()
+        {
+            break;
         }
     }
     pb.finish();
@@ -265,7 +229,6 @@ fn run_indexfile(
     };
 
     let (iwq, workqueue) = chan::bounded(4096 * wcnt);
-    let (hsqs, hsqr) = chan::bounded::<HashQueueItem<&Path>>(256 * wcnt);
     let (idnq, dnq) = chan::bounded::<DoneQueueItem<&Path>>(4096 * wcnt);
     let sigdat = sigdat.disarm_aquire();
     let sigdat = &sigdat;
@@ -282,10 +245,12 @@ fn run_indexfile(
 
             s.spawn(move |_| {
                 let mut stderr = std::io::stderr();
-                while let Ok(x) = dnq.recv() {
-                    if sigdat.got_ctrlc() {
-                        break;
-                    }
+                while !sigdat.got_ctrlc() {
+                    let x = match dnq.recv_timeout(Duration::from_secs(1)) {
+                        Ok(x) => x,
+                        Err(chan::RecvTimeoutError::Timeout) => continue,
+                        Err(chan::RecvTimeoutError::Disconnected) => break,
+                    };
                     if !x.msg.is_empty() {
                         let premsg = logfile.as_ref().map(|_| {
                             format!(
@@ -357,21 +322,21 @@ fn run_indexfile(
                         break;
                     }
                     let ril = ril.trim_start();
-                    let rilp = Path::new(ril);
+                    let file = Path::new(ril);
                     if ril.is_empty() || ril.bytes().next().unwrap() == b'#' {
                         idnq.send(DoneQueueItem {
-                            file: rilp,
+                            file,
                             msg: Vec::new(),
                             is_hookmsg: false,
                         })
                         .unwrap();
                         continue;
                     }
-                    let meta = match std::fs::metadata(rilp) {
+                    let meta = match std::fs::metadata(file) {
                         Ok(x) => x,
                         Err(x) => {
                             idnq.send(DoneQueueItem {
-                                file: rilp.into(),
+                                file,
                                 msg: format!("unable to read file metadata: {}", x).into_bytes(),
                                 is_hookmsg: false,
                             })
@@ -381,7 +346,7 @@ fn run_indexfile(
                     };
                     if !meta.is_file() {
                         idnq.send(DoneQueueItem {
-                            file: rilp.into(),
+                            file,
                             msg: Vec::new(),
                             is_hookmsg: false,
                         })
@@ -390,7 +355,7 @@ fn run_indexfile(
                     }
                     if does_exceed_max_filesize(&meta, max_filesize) {
                         idnq.send(DoneQueueItem {
-                            file: rilp.into(),
+                            file,
                             msg: "file is too big".to_string().into_bytes(),
                             is_hookmsg: false,
                         })
@@ -398,7 +363,7 @@ fn run_indexfile(
                         continue;
                     }
                     ips.set_message(ril);
-                    if iwq.send(rilp).is_err() {
+                    if iwq.send(file).is_err() {
                         break;
                     }
                 }
@@ -416,10 +381,8 @@ fn run_indexfile(
             pb.set_style(pbstyle.clone());
             let pb = mpbs.add(pb);
             let workqueue = workqueue.clone();
-            let hsqs = hsqs.clone();
-            let hsqr = hsqr.clone();
             let idnq = idnq.clone();
-            s.spawn(move |_| worker(sigdat, hook, thashes, pb, workqueue, hsqs, hsqr, idnq));
+            s.spawn(move |_| worker(sigdat, hook, thashes, pb, workqueue, idnq));
         }
         drop(workqueue);
         drop(idnq);
@@ -478,7 +441,6 @@ fn run_globpat(
     };
 
     let (iwq, workqueue) = chan::bounded(1024 * wcnt);
-    let (hsqs, hsqr) = chan::bounded::<HashQueueItem<PathBuf>>(256 * wcnt);
     let (idnq, dnq) = chan::bounded::<DoneQueueItem<PathBuf>>(4096 * wcnt);
     let sigdat = sigdat.disarm_aquire();
     let sigdat = &sigdat;
@@ -494,16 +456,17 @@ fn run_globpat(
             fps.set_prefix(" done ");
             let fps = mpbs.add(fps);
             let workqueue = workqueue.clone();
-            let hsqr = hsqr.clone();
 
             s.spawn(move |_| {
                 let mut stderr = std::io::stderr();
                 let mut cnt: u64 = 0;
-                let (mut dnqlm, mut wkqlm, mut hsqlm) = (0, 0, 0);
-                while let Ok(x) = dnq.recv() {
-                    if sigdat.got_ctrlc() {
-                        break;
-                    }
+                let (mut dnqlm, mut wkqlm) = (0, 0);
+                while !sigdat.got_ctrlc() {
+                    let x = match dnq.recv_timeout(Duration::from_secs(1)) {
+                        Ok(x) => x,
+                        Err(chan::RecvTimeoutError::Timeout) => continue,
+                        Err(chan::RecvTimeoutError::Disconnected) => break,
+                    };
                     if !x.msg.is_empty() {
                         let premsg = logfile.as_ref().map(|_| {
                             format!(
@@ -543,14 +506,19 @@ fn run_globpat(
                         }
                     }
                     cnt += 1;
-                    let (dnql, wkql, hsql) = (dnq.len(), workqueue.len(), hsqr.len());
+                    let (dnql, wkql) = (dnq.len(), workqueue.len());
                     dnqlm = std::cmp::max(dnqlm, dnql);
                     wkqlm = std::cmp::max(wkqlm, wkql);
-                    hsqlm = std::cmp::max(hsqlm, hsql);
-                    fps.set_message(&format!("{}; pending: done {}, workqueue {}, hsq {}", cnt, dnql, wkql, hsql));
+                    fps.set_message(&format!(
+                        "{}; pending: done {}, workqueue {}",
+                        cnt, dnql, wkql
+                    ));
                     fps.tick();
                 }
-                fps.set_message(&format!("{}; peaks: done {}, workqueue {}, hsq {}", cnt, dnqlm, wkqlm, hsqlm));
+                fps.set_message(&format!(
+                    "{}; peaks: done {}, workqueue {}",
+                    cnt, dnqlm, wkqlm
+                ));
                 fps.abandon();
             });
         }
@@ -572,14 +540,11 @@ fn run_globpat(
                     if sigdat.got_ctrlc() {
                         break;
                     }
-                    let rilp = match pathres {
+                    let file = match pathres {
                         Ok(p) => p,
                         Err(e) => {
                             idnq.send(DoneQueueItem {
-                                file: e
-                                    .path()
-                                    .map(Path::to_path_buf)
-                                    .unwrap_or(PathBuf::from("")),
+                                file: e.path().map(Path::to_path_buf).unwrap_or_else(PathBuf::new),
                                 msg: format!("glob iter error: {}", e).into_bytes(),
                                 is_hookmsg: false,
                             })
@@ -587,11 +552,11 @@ fn run_globpat(
                             continue;
                         }
                     };
-                    let meta = match rilp.metadata() {
+                    let meta = match file.metadata() {
                         Ok(x) => x,
                         Err(x) => {
                             idnq.send(DoneQueueItem {
-                                file: rilp.into_path(),
+                                file: file.into_path(),
                                 msg: format!("unable to read file metadata: {}", x).into_bytes(),
                                 is_hookmsg: false,
                             })
@@ -604,15 +569,15 @@ fn run_globpat(
                     }
                     if does_exceed_max_filesize(&meta, max_filesize) {
                         idnq.send(DoneQueueItem {
-                            file: rilp.into_path(),
+                            file: file.into_path(),
                             msg: "file is too big".to_string().into_bytes(),
                             is_hookmsg: false,
                         })
                         .unwrap();
                         continue;
                     }
-                    ips.set_message(&format!("{}", rilp.path().display()));
-                    if iwq.send(rilp.into_path()).is_err() {
+                    ips.set_message(&format!("{}", file.path().display()));
+                    if iwq.send(file.into_path()).is_err() {
                         break;
                     }
                 }
@@ -629,10 +594,8 @@ fn run_globpat(
             pb.set_style(pbstyle.clone());
             let pb = mpbs.add(pb);
             let workqueue = workqueue.clone();
-            let hsqs = hsqs.clone();
-            let hsqr = hsqr.clone();
             let idnq = idnq.clone();
-            s.spawn(move |_| worker(sigdat, hook, thashes, pb, workqueue, hsqs, hsqr, idnq));
+            s.spawn(move |_| worker(sigdat, hook, thashes, pb, workqueue, idnq));
         }
         drop(workqueue);
         drop(idnq);

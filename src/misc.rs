@@ -111,9 +111,8 @@ impl<'a> StrShard<'a> {
 
     #[inline]
     pub fn skip(&mut self, len: usize) {
-        match self {
-            Self::Borrowed { whole, slen: 0 } => *whole = &whole[len..],
-            _ => {}
+        if let Self::Borrowed { whole, slen: 0 } = self {
+            *whole = &whole[len..];
         }
     }
 
@@ -128,7 +127,7 @@ impl<'a> StrShard<'a> {
             Self::Borrowed { whole, slen } => {
                 let slen = *slen;
                 let new_len = slen + ch.len_utf8();
-                *self = if whole[slen..].chars().next() != Some(ch) {
+                *self = if !whole[slen..].starts_with(ch) {
                     // promote to owned
                     let mut owned = whole[..slen].to_string();
                     owned.push(ch);
@@ -159,10 +158,7 @@ impl<'a> StrShard<'a> {
 
 #[inline]
 fn ch_is_quote(ch: char) -> bool {
-    match ch {
-        '"' | '\'' => true,
-        _ => false,
-    }
+    matches!(ch, '"' | '\'')
 }
 
 impl<'a> Iterator for ShellwordSplitter<'a> {
