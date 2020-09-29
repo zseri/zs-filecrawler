@@ -36,11 +36,7 @@ fn worker<FilPath>(
     FilPath: std::convert::AsRef<Path>,
 {
     let mut hasher = sha2::Sha256::new();
-    loop {
-        if sigdat.got_ctrlc() {
-            pb.abandon();
-            break;
-        }
+    while !sigdat.got_ctrlc() {
         pb.tick();
         chan::select! {
             recv(workqueue) -> msg => {
@@ -269,8 +265,8 @@ fn run_indexfile(
     };
 
     let (iwq, workqueue) = chan::bounded(4096 * wcnt);
-    let (hsqs, hsqr) = chan::bounded::<HashQueueItem<&Path>>(4096 * wcnt);
-    let (idnq, dnq) = chan::bounded::<DoneQueueItem<&Path>>(1024 * wcnt);
+    let (hsqs, hsqr) = chan::bounded::<HashQueueItem<&Path>>(256 * wcnt);
+    let (idnq, dnq) = chan::bounded::<DoneQueueItem<&Path>>(4096 * wcnt);
     let sigdat = sigdat.disarm_aquire();
     let sigdat = &sigdat;
     let mpbs = indicatif::MultiProgress::new();
@@ -482,8 +478,8 @@ fn run_globpat(
     };
 
     let (iwq, workqueue) = chan::bounded(1024 * wcnt);
-    let (hsqs, hsqr) = chan::bounded::<HashQueueItem<PathBuf>>(4096 * wcnt);
-    let (idnq, dnq) = chan::bounded::<DoneQueueItem<PathBuf>>(1024 * wcnt);
+    let (hsqs, hsqr) = chan::bounded::<HashQueueItem<PathBuf>>(256 * wcnt);
+    let (idnq, dnq) = chan::bounded::<DoneQueueItem<PathBuf>>(4096 * wcnt);
     let sigdat = sigdat.disarm_aquire();
     let sigdat = &sigdat;
     let mpbs = indicatif::MultiProgress::new();
@@ -497,10 +493,13 @@ fn run_globpat(
             );
             fps.set_prefix(" done ");
             let fps = mpbs.add(fps);
+            let workqueue = workqueue.clone();
+            let hsqr = hsqr.clone();
 
             s.spawn(move |_| {
                 let mut stderr = std::io::stderr();
                 let mut cnt: u64 = 0;
+                let (mut dnqlm, mut wkqlm, mut hsqlm) = (0, 0, 0);
                 while let Ok(x) = dnq.recv() {
                     if sigdat.got_ctrlc() {
                         break;
@@ -544,9 +543,14 @@ fn run_globpat(
                         }
                     }
                     cnt += 1;
-                    fps.set_message(&format!("{}", cnt));
+                    let (dnql, wkql, hsql) = (dnq.len(), workqueue.len(), hsqr.len());
+                    dnqlm = std::cmp::max(dnqlm, dnql);
+                    wkqlm = std::cmp::max(wkqlm, wkql);
+                    hsqlm = std::cmp::max(hsqlm, hsql);
+                    fps.set_message(&format!("{}; pending: done {}, workqueue {}, hsq {}", cnt, dnql, wkql, hsql));
                     fps.tick();
                 }
+                fps.set_message(&format!("{}; peaks: done {}, workqueue {}, hsq {}", cnt, dnqlm, wkqlm, hsqlm));
                 fps.abandon();
             });
         }
