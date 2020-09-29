@@ -79,10 +79,12 @@ fn main() {
                                           skip any file with a length greater than SIZ
                         use-mp y|n        enable/disable parallel hook runs
                         set-hook FILE     set used hook (USAGE: ./hook.sh PATH)
+
                         run FILE          process files from index, read file paths from FILE
                                           (advice: use absolute paths)
                                           This processing is interruptable with Ctrl+C.
-                        run-glob GLOB     process files, gather file paths via GLOB pattern
+                        run-glob BASE GLOB...
+                                          process files, gather file paths via GLOB pattern
 
                         If you want to set the database path, you must specify it
                             as the first command line argument to zs-filecrawler.

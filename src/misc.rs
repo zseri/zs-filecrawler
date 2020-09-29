@@ -72,51 +72,23 @@ impl<'a> ShellwordSplitter<'a> {
     }
 }
 
-enum StrShardInner {
-    Borrowed(usize),
+enum StrShard<'a> {
+    Borrowed { whole: &'a str, slen: usize },
     Owned(String),
-}
-
-impl StrShardInner {
-    #[inline]
-    fn len(&self) -> usize {
-        match self {
-            Self::Borrowed(ref len) => *len,
-            Self::Owned(ref owned) => owned.len(),
-        }
-    }
-
-    fn to_mut(&mut self, whole: &str) -> &mut String {
-        match *self {
-            Self::Borrowed(slen) => {
-                *self = Self::Owned(whole[..slen].to_string());
-                match *self {
-                    Self::Borrowed(_) => unreachable!(),
-                    Self::Owned(ref mut x) => x,
-                }
-            }
-            Self::Owned(ref mut x) => x,
-        }
-    }
-}
-
-pub struct StrShard<'a> {
-    whole: &'a str,
-    inner: StrShardInner,
 }
 
 impl<'a> StrShard<'a> {
     #[inline]
     pub fn new(whole: &'a str) -> Self {
-        Self {
-            whole,
-            inner: StrShardInner::Borrowed(0),
-        }
+        Self::Borrowed { whole, slen: 0 }
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        self.inner.len()
+        match self {
+            Self::Borrowed { ref slen, .. } => *slen,
+            Self::Owned(ref owned) => owned.len(),
+        }
     }
 
     #[inline]
@@ -124,50 +96,62 @@ impl<'a> StrShard<'a> {
         self.len() == 0
     }
 
+    fn to_mut(&mut self) -> &mut String {
+        match *self {
+            Self::Borrowed { whole, slen } => {
+                *self = Self::Owned(whole[..slen].to_string());
+                match *self {
+                    Self::Borrowed { .. } => unreachable!(),
+                    Self::Owned(ref mut x) => x,
+                }
+            }
+            Self::Owned(ref mut x) => x,
+        }
+    }
+
     #[inline]
     pub fn skip(&mut self, len: usize) {
-        if !self.is_empty() {
-            return;
+        match self {
+            Self::Borrowed { whole, slen: 0 } => *whole = &whole[len..],
+            _ => {}
         }
-        self.whole = &self.whole[len..];
     }
 
     // promotes self to owned
+    #[inline]
     pub fn push_owned(&mut self, ch: char) {
-        self.inner.to_mut(self.whole).push(ch);
+        self.to_mut().push(ch);
     }
 
     pub fn push(&mut self, ch: char) {
-        use StrShardInner as I;
-        match &mut self.inner {
-            I::Borrowed(slen) => {
+        match self {
+            Self::Borrowed { whole, slen } => {
                 let slen = *slen;
                 let new_len = slen + ch.len_utf8();
-                self.inner = if self.whole[slen..].chars().next() != Some(ch) {
+                *self = if whole[slen..].chars().next() != Some(ch) {
                     // promote to owned
-                    let mut owned = self.whole[..slen].to_string();
+                    let mut owned = whole[..slen].to_string();
                     owned.push(ch);
-                    I::Owned(owned)
+                    Self::Owned(owned)
                 } else {
                     // remain borrowed
-                    I::Borrowed(new_len)
+                    Self::Borrowed {
+                        whole,
+                        slen: new_len,
+                    }
                 };
             }
-            I::Owned(ref mut x) => {
-                x.push(ch);
-            }
-        };
+            Self::Owned(ref mut x) => x.push(ch),
+        }
     }
 
     pub fn finish(self) -> Option<Cow<'a, str>> {
-        let Self { whole, inner } = self;
-        use StrShardInner as I;
-        if inner.len() == 0 {
+        if self.is_empty() {
             None
         } else {
-            Some(match inner {
-                I::Borrowed(slen) => Cow::Borrowed(&whole[..slen]),
-                I::Owned(x) => Cow::Owned(x),
+            Some(match self {
+                Self::Borrowed { whole, slen } => Cow::Borrowed(&whole[..slen]),
+                Self::Owned(x) => Cow::Owned(x),
             })
         }
     }
