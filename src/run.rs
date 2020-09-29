@@ -575,7 +575,7 @@ fn run_globpat(
                                 file: e
                                     .path()
                                     .map(Path::to_path_buf)
-                                    .unwrap_or(PathBuf::from("/")),
+                                    .unwrap_or(PathBuf::from("")),
                                 msg: format!("glob iter error: {}", e).into_bytes(),
                                 is_hookmsg: false,
                             })
@@ -596,12 +596,6 @@ fn run_globpat(
                         }
                     };
                     if !meta.is_file() {
-                        idnq.send(DoneQueueItem {
-                            file: rilp.into_path(),
-                            msg: Vec::new(),
-                            is_hookmsg: false,
-                        })
-                        .unwrap();
                         continue;
                     }
                     if does_exceed_max_filesize(&meta, max_filesize) {
