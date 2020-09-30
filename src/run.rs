@@ -257,6 +257,8 @@ fn done_worker<FilPath, F>(
             break;
         }
     }
+    // fix count if disconnected or Ctrl+C
+    cntupd(&fpb, u64::from(dncnt.swap(0, Ordering::SeqCst)));
     fpb.abandon();
 }
 
