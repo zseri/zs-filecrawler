@@ -436,9 +436,7 @@ fn run_globpat(
         let base = match it.next() {
             Some(Ok(x)) => x,
             _ => {
-                eprintln!(
-                    "ERROR: failed to parse 'run-glob' arguments, invalid invocation (base path)"
-                );
+                error!("Failed to parse 'run-glob' arguments, invalid invocation (base path)");
                 return Ok(());
             }
         };
@@ -447,7 +445,7 @@ fn run_globpat(
         let patterns = match it.collect::<Result<Vec<_>, _>>() {
             Ok(x) => x,
             Err(_) => {
-                eprintln!("ERROR: failed to parse 'run-glob' arguments, invalid invocation (pattern list)");
+                error!("Failed to parse 'run-glob' arguments, invalid invocation (pattern list)");
                 return Ok(());
             }
         };
@@ -457,8 +455,8 @@ fn run_globpat(
             .build()
         {
             Ok(x) => x,
-            Err(_) => {
-                eprintln!("ERROR: failed to prepare the GlobWalker");
+            Err(e) => {
+                error!("Failed to prepare the GlobWalker: {}", e);
                 return Ok(());
             }
         }
