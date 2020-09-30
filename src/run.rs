@@ -17,6 +17,91 @@ pub enum IngestList<'a> {
     GlobPattern(&'a str),
 }
 
+pub fn run(db: &sled::Db, sigdat: &SignalData, ingestl: IngestList<'_>) -> Result<(), sled::Error> {
+    let max_filesize: Option<u64> = db.get(dbkeys::MAX_FSIZ)?.and_then(|iv| {
+        let mut buf = [0u8; 8];
+        if iv.len() != buf.len() {
+            return None;
+        }
+        buf.copy_from_slice(&iv[..]);
+        Some(u64::from_le_bytes(buf))
+    });
+
+    let wcnt: usize = 1 + if db.get(dbkeys::USE_MP)?.is_some() {
+        num_cpus::get()
+    } else {
+        0
+    };
+
+    let hook = match db.get(dbkeys::HOOK)? {
+        Some(h) => {
+            let p = match std::str::from_utf8(&*h) {
+                Ok(x) => Path::new(x),
+                Err(x) => {
+                    error!("Invalid hook in DB (non-utf8): error = {}", x);
+                    return Ok(());
+                }
+            };
+            if !p.is_file() {
+                error!("Hook not found: {}", p.display());
+                return Ok(());
+            }
+            p.to_path_buf()
+        }
+        None => {
+            error!("No hook set!");
+            return Ok(());
+        }
+    };
+    let hook = hook.as_path();
+
+    let dont_suppress = db.get(dbkeys::SUPPRESS_LOGMSGS)?.is_none();
+    let logfile = match db.get(dbkeys::LOGFILE)? {
+        None => None,
+        Some(x) => {
+            let x = std::str::from_utf8(&x[..]).expect("non utf-8 log file name");
+            Some(
+                std::fs::OpenOptions::new()
+                    .read(false)
+                    .append(true)
+                    .create(true)
+                    .open(x)?,
+            )
+        }
+    };
+
+    let thashes = db.open_tree(
+        dbtrees::HASHES_
+            .iter()
+            .chain(sha2::Sha256::digest(&*read_from_file(hook)?).iter())
+            .copied()
+            .collect::<Vec<u8>>(),
+    )?;
+
+    match ingestl {
+        IngestList::IndexFile(ingestf) => run_indexfile(
+            &thashes,
+            sigdat,
+            max_filesize,
+            wcnt,
+            hook,
+            dont_suppress,
+            logfile,
+            ingestf,
+        ),
+        IngestList::GlobPattern(glob_pattern) => run_globpat(
+            &thashes,
+            sigdat,
+            max_filesize,
+            wcnt,
+            hook,
+            dont_suppress,
+            logfile,
+            glob_pattern,
+        ),
+    }
+}
+
 fn worker<FilPath>(
     sigdat: &SignalDataUnArmed,
     hook: &Path,
@@ -104,6 +189,69 @@ fn worker<FilPath>(
     pb.finish();
 }
 
+fn done_worker<FilPath, F>(
+    sigdat: &SignalDataUnArmed,
+    dont_suppress: bool,
+    mut logfile: Option<std::fs::File>,
+    fpb: indicatif::ProgressBar,
+    dnq: chan::Receiver<DoneQueueItem<FilPath>>,
+    mut cntupd: F,
+) where
+    FilPath: std::convert::AsRef<Path>,
+    F: FnMut(&indicatif::ProgressBar, bool) -> bool,
+{
+    let mut stderr = std::io::stderr();
+    while !sigdat.got_ctrlc() {
+        let has_done_file = match dnq.recv_timeout(Duration::from_secs(1)) {
+            Ok(x) if !x.msg.is_empty() => {
+                let fdi = x.file.as_ref().display();
+                let premsg = logfile.as_ref().map(|_| {
+                    format!(
+                        "[{}] {}: ",
+                        if x.is_hookmsg { "HOOK" } else { "INGEST" },
+                        fdi
+                    )
+                });
+                if let Ok(y) = std::str::from_utf8(&x.msg[..]) {
+                    let y = y.trim();
+                    if dont_suppress {
+                        for i in y.lines() {
+                            fpb.println(format!("{}: {}", fdi, i.trim()));
+                        }
+                    }
+                    if let Some(log) = logfile.as_mut() {
+                        let premsg = premsg.unwrap();
+                        for i in y.lines() {
+                            writeln!(log, "{}{}", premsg, i.trim()).unwrap();
+                        }
+                    }
+                } else {
+                    if dont_suppress {
+                        stderr.write_all(format!("{}: ", fdi).as_bytes()).unwrap();
+                        stderr.write_all(&x.msg[..]).unwrap();
+                        stderr.write_all(b"\n").unwrap();
+                        stderr.flush().unwrap();
+                    }
+                    if let Some(log) = logfile.as_mut() {
+                        log.write_all(premsg.unwrap().as_bytes()).unwrap();
+                        log.write_all(&x.msg[..]).unwrap();
+                        log.write_all(b"\n").unwrap();
+                        log.flush().unwrap();
+                    }
+                }
+                true
+            }
+            Ok(_) => true,
+            Err(chan::RecvTimeoutError::Disconnected) => break,
+            Err(chan::RecvTimeoutError::Timeout) => false,
+        };
+        if !cntupd(&fpb, has_done_file) {
+            break;
+        }
+    }
+    fpb.abandon();
+}
+
 fn does_exceed_max_filesize(fmd: &std::fs::Metadata, idx_max_filesize: Option<u64>) -> bool {
     if let Some(max_fsiz) = idx_max_filesize {
         if fmd.len() > max_fsiz {
@@ -113,91 +261,6 @@ fn does_exceed_max_filesize(fmd: &std::fs::Metadata, idx_max_filesize: Option<u6
     false
 }
 
-pub fn run(db: &sled::Db, sigdat: &SignalData, ingestl: IngestList<'_>) -> Result<(), sled::Error> {
-    let max_filesize: Option<u64> = db.get(dbkeys::MAX_FSIZ)?.and_then(|iv| {
-        let mut buf = [0u8; 8];
-        if iv.len() != buf.len() {
-            return None;
-        }
-        buf.copy_from_slice(&iv[..]);
-        Some(u64::from_le_bytes(buf))
-    });
-
-    let wcnt: usize = 1 + if db.get(dbkeys::USE_MP)?.is_some() {
-        num_cpus::get()
-    } else {
-        0
-    };
-
-    let hook = match db.get(dbkeys::HOOK)? {
-        Some(h) => {
-            let p = match std::str::from_utf8(&*h) {
-                Ok(x) => Path::new(x),
-                Err(x) => {
-                    error!("Invalid hook in DB (non-utf8): error = {}", x);
-                    return Ok(());
-                }
-            };
-            if !p.is_file() {
-                error!("Hook not found: {}", p.display());
-                return Ok(());
-            }
-            p.to_path_buf()
-        }
-        None => {
-            error!("No hook set!");
-            return Ok(());
-        }
-    };
-    let hook = hook.as_path();
-
-    let dont_suppress = db.get(dbkeys::SUPPRESS_LOGMSGS)?.is_none();
-    let logfile = match db.get(dbkeys::LOGFILE)? {
-        None => None,
-        Some(x) => {
-            let x = std::str::from_utf8(&x[..]).expect("non utf-8 log file name");
-            Some(
-                std::fs::OpenOptions::new()
-                    .read(false)
-                    .append(true)
-                    .create(true)
-                    .open(x)?,
-            )
-        }
-    };
-
-    let thashes = db.open_tree(
-        dbtrees::HASHES_
-            .iter()
-            .chain(sha2::Sha256::digest(&*read_from_file(hook)?).iter())
-            .copied()
-            .collect::<Vec<u8>>(),
-    )?;
-
-    match ingestl {
-        IngestList::IndexFile(ingestf) => run_indexfile(
-            &thashes,
-            sigdat,
-            max_filesize,
-            wcnt,
-            hook,
-            dont_suppress,
-            logfile,
-            ingestf,
-        ),
-        IngestList::GlobPattern(glob_pattern) => run_globpat(
-            &thashes,
-            sigdat,
-            max_filesize,
-            wcnt,
-            hook,
-            dont_suppress,
-            logfile,
-            glob_pattern,
-        ),
-    }
-}
-
 fn run_indexfile(
     thashes: &sled::Tree,
     sigdat: &SignalData,
@@ -205,7 +268,7 @@ fn run_indexfile(
     wcnt: usize,
     hook: &Path,
     dont_suppress: bool,
-    mut logfile: Option<std::fs::File>,
+    logfile: Option<std::fs::File>,
     ingestf: &Path,
 ) -> Result<(), sled::Error> {
     if does_exceed_max_filesize(&std::fs::metadata(ingestf)?, max_filesize) {
@@ -244,57 +307,19 @@ fn run_indexfile(
             let fpb = mpbs.add(fpb);
 
             s.spawn(move |_| {
-                let mut stderr = std::io::stderr();
-                while !sigdat.got_ctrlc() {
-                    let x = match dnq.recv_timeout(Duration::from_secs(1)) {
-                        Ok(x) => x,
-                        Err(chan::RecvTimeoutError::Timeout) => continue,
-                        Err(chan::RecvTimeoutError::Disconnected) => break,
-                    };
-                    if !x.msg.is_empty() {
-                        let premsg = logfile.as_ref().map(|_| {
-                            format!(
-                                "[{}] {}: ",
-                                if x.is_hookmsg { "HOOK" } else { "INGEST" },
-                                x.file.display()
-                            )
-                        });
-                        if let Ok(y) = std::str::from_utf8(&x.msg[..]) {
-                            let y = y.trim();
-                            if dont_suppress {
-                                for i in y.lines() {
-                                    fpb.println(format!("{}: {}", x.file.display(), i.trim()));
-                                }
-                            }
-                            if let Some(log) = logfile.as_mut() {
-                                let premsg = premsg.unwrap();
-                                for i in y.lines() {
-                                    writeln!(log, "{}{}", premsg, i.trim()).unwrap();
-                                }
-                            }
-                        } else {
-                            if dont_suppress {
-                                stderr
-                                    .write_all(format!("{}: ", x.file.display()).as_bytes())
-                                    .unwrap();
-                                stderr.write_all(&x.msg[..]).unwrap();
-                                stderr.write_all(b"\n").unwrap();
-                                stderr.flush().unwrap();
-                            }
-                            if let Some(log) = logfile.as_mut() {
-                                log.write_all(premsg.unwrap().as_bytes()).unwrap();
-                                log.write_all(&x.msg[..]).unwrap();
-                                log.write_all(b"\n").unwrap();
-                                log.flush().unwrap();
-                            }
+                done_worker(
+                    sigdat,
+                    dont_suppress,
+                    logfile,
+                    fpb,
+                    dnq,
+                    move |fpb, hdf| {
+                        if hdf {
+                            fpb.inc(1);
                         }
-                    }
-                    fpb.inc(1);
-                    if fpb.position() == fpb.length() {
-                        break;
-                    }
-                }
-                fpb.abandon();
+                        fpb.position() != fpb.length()
+                    },
+                )
             });
         }
 
@@ -403,7 +428,7 @@ fn run_globpat(
     wcnt: usize,
     hook: &Path,
     dont_suppress: bool,
-    mut logfile: Option<std::fs::File>,
+    logfile: Option<std::fs::File>,
     glob_pattern: &str,
 ) -> Result<(), sled::Error> {
     let paths = {
@@ -455,71 +480,24 @@ fn run_globpat(
             );
             fps.set_prefix(" done ");
             let fps = mpbs.add(fps);
-            let workqueue = workqueue.clone();
 
             s.spawn(move |_| {
-                let mut stderr = std::io::stderr();
                 let mut cnt: u64 = 0;
-                let (mut dnqlm, mut wkqlm) = (0, 0);
-                while !sigdat.got_ctrlc() {
-                    let x = match dnq.recv_timeout(Duration::from_secs(1)) {
-                        Ok(x) => x,
-                        Err(chan::RecvTimeoutError::Timeout) => continue,
-                        Err(chan::RecvTimeoutError::Disconnected) => break,
-                    };
-                    if !x.msg.is_empty() {
-                        let premsg = logfile.as_ref().map(|_| {
-                            format!(
-                                "[{}] {}: ",
-                                if x.is_hookmsg { "HOOK" } else { "INGEST" },
-                                x.file.display()
-                            )
-                        });
-                        if let Ok(y) = std::str::from_utf8(&x.msg[..]) {
-                            let y = y.trim();
-                            if dont_suppress {
-                                for i in y.lines() {
-                                    fps.println(format!("{}: {}", x.file.display(), i.trim()));
-                                }
-                            }
-                            if let Some(log) = logfile.as_mut() {
-                                let premsg = premsg.unwrap();
-                                for i in y.lines() {
-                                    writeln!(log, "{}{}", premsg, i.trim()).unwrap();
-                                }
-                            }
-                        } else {
-                            if dont_suppress {
-                                stderr
-                                    .write_all(format!("{}: ", x.file.display()).as_bytes())
-                                    .unwrap();
-                                stderr.write_all(&x.msg[..]).unwrap();
-                                stderr.write_all(b"\n").unwrap();
-                                stderr.flush().unwrap();
-                            }
-                            if let Some(log) = logfile.as_mut() {
-                                log.write_all(premsg.unwrap().as_bytes()).unwrap();
-                                log.write_all(&x.msg[..]).unwrap();
-                                log.write_all(b"\n").unwrap();
-                                log.flush().unwrap();
-                            }
+                done_worker(
+                    sigdat,
+                    dont_suppress,
+                    logfile,
+                    fps,
+                    dnq,
+                    move |fps, hdf| {
+                        if hdf {
+                            cnt += 1;
                         }
-                    }
-                    cnt += 1;
-                    let (dnql, wkql) = (dnq.len(), workqueue.len());
-                    dnqlm = std::cmp::max(dnqlm, dnql);
-                    wkqlm = std::cmp::max(wkqlm, wkql);
-                    fps.set_message(&format!(
-                        "{}; pending: done {}, workqueue {}",
-                        cnt, dnql, wkql
-                    ));
-                    fps.tick();
-                }
-                fps.set_message(&format!(
-                    "{}; peaks: done {}, workqueue {}",
-                    cnt, dnqlm, wkqlm
-                ));
-                fps.abandon();
+                        fps.set_message(&format!("{}", cnt));
+                        fps.tick();
+                        true
+                    },
+                )
             });
         }
 
