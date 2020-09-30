@@ -4,6 +4,7 @@ use digest::Digest;
 use indicatif::ProgressBar;
 use log::error;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::{convert::TryInto, io::Write, mem::drop, time::Duration};
 
 struct DoneQueueItem<F> {
@@ -108,6 +109,7 @@ fn worker<FilPath>(
     thashes: &sled::Tree,
     pb: ProgressBar,
     workqueue: chan::Receiver<FilPath>,
+    dncnt: &AtomicU32,
     idnq: chan::Sender<DoneQueueItem<FilPath>>,
 ) where
     FilPath: std::convert::AsRef<Path>,
@@ -175,7 +177,9 @@ fn worker<FilPath>(
             pb.set_message(&format!("hash {} file {}: skipped", h3, fdi));
             Vec::new()
         };
-        if idnq
+        if msg.is_empty() {
+            dncnt.fetch_add(1, Ordering::SeqCst);
+        } else if idnq
             .send(DoneQueueItem {
                 file,
                 msg,
@@ -194,11 +198,12 @@ fn done_worker<FilPath, F>(
     dont_suppress: bool,
     mut logfile: Option<std::fs::File>,
     fpb: indicatif::ProgressBar,
+    dncnt: &AtomicU32,
     dnq: chan::Receiver<DoneQueueItem<FilPath>>,
     mut cntupd: F,
 ) where
     FilPath: std::convert::AsRef<Path>,
-    F: FnMut(&indicatif::ProgressBar, bool) -> bool,
+    F: FnMut(&indicatif::ProgressBar, u64) -> bool,
 {
     let mut stderr = std::io::stderr();
     while !sigdat.got_ctrlc() {
@@ -245,7 +250,10 @@ fn done_worker<FilPath, F>(
             Err(chan::RecvTimeoutError::Disconnected) => break,
             Err(chan::RecvTimeoutError::Timeout) => false,
         };
-        if !cntupd(&fpb, has_done_file) {
+        if !cntupd(
+            &fpb,
+            u64::from(dncnt.swap(0, Ordering::SeqCst)) + if has_done_file { 1 } else { 0 },
+        ) {
             break;
         }
     }
@@ -293,6 +301,8 @@ fn run_indexfile(
 
     let (iwq, workqueue) = chan::bounded(4096 * wcnt);
     let (idnq, dnq) = chan::bounded::<DoneQueueItem<&Path>>(4096 * wcnt);
+    let dncnt = AtomicU32::new(0);
+    let dncnt = &dncnt;
     let sigdat = sigdat.disarm_aquire();
     let sigdat = &sigdat;
     let mpbs = indicatif::MultiProgress::new();
@@ -312,11 +322,10 @@ fn run_indexfile(
                     dont_suppress,
                     logfile,
                     fpb,
+                    dncnt,
                     dnq,
-                    move |fpb, hdf| {
-                        if hdf {
-                            fpb.inc(1);
-                        }
+                    move |fpb, delta| {
+                        fpb.inc(delta);
                         fpb.position() != fpb.length()
                     },
                 )
@@ -349,12 +358,7 @@ fn run_indexfile(
                     let ril = ril.trim_start();
                     let file = Path::new(ril);
                     if ril.is_empty() || ril.bytes().next().unwrap() == b'#' {
-                        idnq.send(DoneQueueItem {
-                            file,
-                            msg: Vec::new(),
-                            is_hookmsg: false,
-                        })
-                        .unwrap();
+                        dncnt.fetch_add(1, Ordering::SeqCst);
                         continue;
                     }
                     let meta = match std::fs::metadata(file) {
@@ -370,12 +374,7 @@ fn run_indexfile(
                         }
                     };
                     if !meta.is_file() {
-                        idnq.send(DoneQueueItem {
-                            file,
-                            msg: Vec::new(),
-                            is_hookmsg: false,
-                        })
-                        .unwrap();
+                        dncnt.fetch_add(1, Ordering::SeqCst);
                         continue;
                     }
                     if does_exceed_max_filesize(&meta, max_filesize) {
@@ -407,7 +406,7 @@ fn run_indexfile(
             let pb = mpbs.add(pb);
             let workqueue = workqueue.clone();
             let idnq = idnq.clone();
-            s.spawn(move |_| worker(sigdat, hook, thashes, pb, workqueue, idnq));
+            s.spawn(move |_| worker(sigdat, hook, thashes, pb, workqueue, dncnt, idnq));
         }
         drop(workqueue);
         drop(idnq);
@@ -467,6 +466,8 @@ fn run_globpat(
 
     let (iwq, workqueue) = chan::bounded(1024 * wcnt);
     let (idnq, dnq) = chan::bounded::<DoneQueueItem<PathBuf>>(4096 * wcnt);
+    let dncnt = AtomicU32::new(0);
+    let dncnt = &dncnt;
     let sigdat = sigdat.disarm_aquire();
     let sigdat = &sigdat;
     let mpbs = indicatif::MultiProgress::new();
@@ -488,13 +489,11 @@ fn run_globpat(
                     dont_suppress,
                     logfile,
                     fps,
+                    dncnt,
                     dnq,
-                    move |fps, hdf| {
-                        if hdf {
-                            cnt += 1;
-                        }
+                    move |fps, delta| {
+                        cnt += delta;
                         fps.set_message(&format!("{}", cnt));
-                        fps.tick();
                         true
                     },
                 )
@@ -573,7 +572,7 @@ fn run_globpat(
             let pb = mpbs.add(pb);
             let workqueue = workqueue.clone();
             let idnq = idnq.clone();
-            s.spawn(move |_| worker(sigdat, hook, thashes, pb, workqueue, idnq));
+            s.spawn(move |_| worker(sigdat, hook, thashes, pb, workqueue, dncnt, idnq));
         }
         drop(workqueue);
         drop(idnq);
