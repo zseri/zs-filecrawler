@@ -1,4 +1,5 @@
 use log::warn;
+use signal_hook::consts::SIGINT;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -24,7 +25,7 @@ impl SignalDataIntern {
     }
     pub fn handle_ctrlc(&self) {
         if self.is_ctrlc_armed() {
-            std::process::exit(128 + signal_hook::SIGINT);
+            std::process::exit(128 + SIGINT);
         } else {
             self.ctrlc.store(true, Ordering::SeqCst);
         }
@@ -55,7 +56,7 @@ impl Drop for SignalDataUnArmed<'_> {
 }
 
 pub fn register_signal_handlers(dat: SignalData) {
-    unsafe { signal_hook::register(signal_hook::SIGINT, move || dat.handle_ctrlc()) }
+    unsafe { signal_hook::low_level::register(SIGINT, move || dat.handle_ctrlc()) }
         .map_err(|e| {
             warn!("Failed to register for SIGINT {:?}", e);
             e

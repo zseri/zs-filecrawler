@@ -9,8 +9,8 @@ repository = "https://github.com/zserik/zs-filecrawler"
 
 [dependencies]
 byte-unit = "4.0"
-crossbeam-channel = "0.4"
-crossbeam-utils = "0.7"
+crossbeam-channel = "0.5"
+crossbeam-utils = "0.8"
 digest = "0.9"
 globwalk = "0.8"
 hex = "0.4"
@@ -20,10 +20,16 @@ log = "0.4"
 num_cpus = "1.13"
 readfilez = "0.2"
 sha2 = "0.9"
-signal-hook = "0.1"
-simplelog = "0.8"
-sled = { version = "0.34", features = ["compression"] }
+simplelog = "0.9"
 text_io = "0.1"
+
+[dependencies.signal-hook]
+version = "0.3"
+default-features = false
+
+[dependencies.sled]
+version = "0.34"
+features = ["compression"]
 
 [features]
 io_uring = ["sled/io_uring"]
