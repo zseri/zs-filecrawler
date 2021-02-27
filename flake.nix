@@ -11,7 +11,7 @@
   };
   outputs = { self, nixpkgs, flake-utils, flake-compat }:
     let
-      progname = "crulz";
+      progname = "zs-filecrawler";
       overlay = final: prev: {
         ${progname} = (prev.pkgs.callPackage ./Cargo.nix {}).rootCrate.build;
       };
